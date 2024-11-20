@@ -1,74 +1,107 @@
 import gi
-gi.require_version("Gtk", "3.0")
+import subprocess
+from pymediainfo import MediaInfo
 from gi.repository import Gtk
-from scripts.media_conversion import convert_video, convert_audio  # Import functions
+
+gi.require_version("Gtk", "3.0")
 
 class MainWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="Downys")
 
-        # Set up main layout
+        # Головний контейнер
         vbox = Gtk.VBox(spacing=10)
         self.add(vbox)
 
-        # URL input field
-        hbox_url = Gtk.HBox(spacing=5)
-        vbox.pack_start(hbox_url, False, False, 0)
-        
-        self.url_label = Gtk.Label(label="URL:")
-        hbox_url.pack_start(self.url_label, False, False, 0)
-        
-        self.url_entry = Gtk.Entry()
-        hbox_url.pack_start(self.url_entry, True, True, 0)
+        # Кнопка для обробки метаданих
+        self.metadata_video_button = Gtk.Button(label="Process Video Metadata")
+        self.metadata_video_button.connect("clicked", self.on_metadata_video_clicked)
+        vbox.pack_start(self.metadata_video_button, False, False, 0)
 
-        # Buttons
+        # Інші кнопки
         self.httrack_button = Gtk.Button(label="HTTrack")
         vbox.pack_start(self.httrack_button, False, False, 0)
-        
-        self.youtube_button = Gtk.Button(label="YouTube")
+
+        self.youtube_button = Gtk.Button(label="YouTube Download")
         vbox.pack_start(self.youtube_button, False, False, 0)
-        
-        self.upload_button = Gtk.Button(label="Upload to Server")
-        vbox.pack_start(self.upload_button, False, False, 0)
-        
-        self.server_settings_button = Gtk.Button(label="Server Settings")
-        vbox.pack_start(self.server_settings_button, False, False, 0)
 
-        # Add new buttons for conversion
-        self.convert_video_button = Gtk.Button(label="Convert Video")
-        self.convert_audio_button = Gtk.Button(label="Convert Audio")
-        
-        vbox.pack_start(self.convert_video_button, False, False, 0)
-        vbox.pack_start(self.convert_audio_button, False, False, 0)
+    def on_metadata_video_clicked(self, widget):
+        self.open_file_chooser('video')
 
-        # Connect buttons to functions
-        self.convert_video_button.connect("clicked", self.on_convert_video)
-        self.convert_audio_button.connect("clicked", self.on_convert_audio)
+    def open_file_chooser(self, file_type):
+        dialog = Gtk.FileChooserDialog(f"Choose a {file_type.capitalize()} File", self, Gtk.FileChooserAction.OPEN,
+                                       ("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK))
 
-        # Progress Bar
-        self.progress_bar = Gtk.ProgressBar()
-        vbox.pack_start(self.progress_bar, False, False, 0)
+        # Фільтрація файлів за типом
+        if file_type == 'video':
+            filter = Gtk.FileFilter()
+            filter.set_name("Video Files")
+            filter.add_mime_type("video/*")
+            dialog.add_filter(filter)
 
-    def on_convert_video(self, widget):
-        # Example input/output for video conversion
-        input_file = "input_video.mkv"  # Replace with actual path or URL
-        output_file = "output_video.mp4"
-        convert_video(input_file, output_file)
-        
-    def on_convert_audio(self, widget):
-        # Example input/output for audio conversion
-        input_file = "input_audio.mp4"  # Replace with actual path or URL
-        output_file = "output_audio.aac"
-        convert_audio(input_file, output_file)
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            file_path = dialog.get_filename()
+            self.show_metadata_edit_dialog(file_path)
 
-    def show_warning_dialog(self, message):
-        dialog = Gtk.MessageDialog(
-            self,
-            0,
-            Gtk.MessageType.WARNING,
-            Gtk.ButtonsType.OK,
-            "Warning",
-        )
-        dialog.format_secondary_text(message)
-        dialog.run()
         dialog.destroy()
+
+    def show_metadata_edit_dialog(self, file_path):
+        # Отримуємо метадані за допомогою pymediainfo
+        media_info = MediaInfo.parse(file_path)
+        video_info = media_info.tracks[0]  # Отримаємо перший відеотрек
+        resolution = f"{video_info.width}x{video_info.height}"
+        duration = video_info.duration / 1000  # Перетворюємо на секунди
+
+        # Створюємо діалог для редагування
+        dialog = Gtk.Dialog("Edit Metadata", self, Gtk.DialogFlags.MODAL,
+                            ("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK))
+
+        content_area = dialog.get_content_area()
+
+        # Додаємо поля для редагування
+        resolution_label = Gtk.Label(label="Resolution (e.g. 1920x1080):")
+        duration_label = Gtk.Label(label="Duration (seconds):")
+
+        resolution_entry = Gtk.Entry(text=resolution)
+        duration_entry = Gtk.Entry(text=f"{duration:.2f}")
+
+        content_area.add(resolution_label)
+        content_area.add(resolution_entry)
+        content_area.add(duration_label)
+        content_area.add(duration_entry)
+
+        dialog.show_all()
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            # Отримуємо значення з полів вводу
+            new_resolution = resolution_entry.get_text()
+            new_duration = duration_entry.get_text()
+
+            # Зберігаємо нові метадані (за допомогою ffmpeg або іншого інструмента)
+            self.update_video_metadata(file_path, new_resolution, new_duration)
+
+        dialog.destroy()
+
+    def update_video_metadata(self, file_path, new_resolution, new_duration):
+        # Функція для оновлення метаданих відеофайлу за допомогою ffmpeg
+
+        # Розбір нового значення роздільної здатності
+        width, height = new_resolution.split('x')
+
+        # Викликаємо ffmpeg для зміни метаданих
+        output_file = "output_" + file_path.split("/")[-1]
+        command = [
+            "ffmpeg", "-i", file_path, "-s", f"{width}x{height}",
+            "-t", new_duration, "-map_metadata", "0", "-c:v", "libx264", "-c:a", "aac",
+            "-strict", "experimental", output_file
+        ]
+        subprocess.run(command, check=True)
+        print(f"Updated video metadata saved to: {output_file}")
+
+# Запуск програми
+win = MainWindow()
+win.connect("destroy", Gtk.main_quit)
+win.show_all()
+Gtk.main()

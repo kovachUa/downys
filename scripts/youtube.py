@@ -1,48 +1,57 @@
-import yt_dlp
 import os
-import sys
+import yt_dlp
+import json
+import re
 
-# Визначення директорії для збереження
-output_dir = './downloads'  # Можна змінити на будь-яку іншу директорію
+# Function to sanitize the filename
+def sanitize_filename(filename):
+    return re.sub(r'[^\w\-_\. ]', '_', filename)
 
+# Load configuration from file
+def load_config():
+    with open('config.json', 'r') as f:
+        return json.load(f)
+
+# Main function to download YouTube video
 def download_youtube_video(video_url):
+    config = load_config()  # Load config from file
+
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',  # Завантажити найкраще відео та аудіо, якщо можливо
-        'outtmpl': f'{output_dir}/%(uploader)s/%(title)s.%(ext)s',  # Шаблон імені файлу
+        'format': 'bestvideo+bestaudio/best',  # Best quality video and audio
+        'outtmpl': f"{config['output_dir']}/%(uploader)s/%(title)s.%(ext)s",  # Output template
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',  # Перетворення в mp4 (якщо потрібно)
+            'preferedformat': 'mp4',  # Convert to mp4 if needed
         }],
-        'merge_output_format': 'mp4',  # Якщо відео та аудіо завантажуються окремо, їх злиття в один mp4 файл
-        'sleep_interval': 0.02,
-        'max_sleep_interval': 0.05
+        'merge_output_format': 'mp4',  # Merge the video and audio into MP4
+        'sleep_interval': config["sleep_interval"],  # Configured sleep interval between downloads
+        'max_sleep_interval': config["max_sleep_interval"],  # Max sleep interval
+        'noplaylist': True,  # Disable playlist downloads, only download the specific video
+        'prefer_free_formats': False,  # Prefer paid formats if available (e.g., higher quality)
     }
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(config["output_dir"], exist_ok=True)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info_dict = ydl.extract_info(video_url, download=True)
             uploader = info_dict.get('uploader', 'Unknown_Channel')
-            uploader_dir = os.path.join(output_dir, uploader)
+            title = info_dict.get('title', 'Unknown_Title')
+
+            # Ensure the uploader directory is created
+            uploader_dir = os.path.join(config["output_dir"], uploader)
             os.makedirs(uploader_dir, exist_ok=True)
+
+            # Filename for the downloaded file
+            filename = f"{title}.mp4"
+            sanitized_filename = sanitize_filename(filename)
+
+            # Get the correct file path where the video is saved
+            downloaded_filename = os.path.join(uploader_dir, sanitized_filename)
+
+            # Debugging: Print paths to verify
+            print(f"Завантаження відео: {downloaded_filename}")
+            print(f"Файл успішно збережено в {downloaded_filename}")
+
         except yt_dlp.utils.DownloadError as e:
-            print(f"Error downloading video: {e}")
-            sys.exit(1)
-
-    return uploader
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Введіть URL каналу або відео.")
-        sys.exit(1)
-
-    video_url = sys.argv[1]
-
-    # Додати ytsearch, якщо не URL
-    if not (video_url.startswith('http://') or video_url.startswith('https://')):
-        video_url = f"ytsearch:{video_url}"
-
-    downloader = download_youtube_video(video_url)
-
-    print(f"Відео збережено локально в директорії {output_dir}/{downloader}.")
+            print(f"Помилка при завантаженні відео: {e}")

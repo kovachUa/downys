@@ -1,41 +1,32 @@
 import os
-import socket
+import re
 from tqdm import tqdm
 
 BUFFER_SIZE = 4096
 
 def upload_file_to_server(host, port, file_path, update_progress_callback=None):
+    print("Завантаження файлу локально...")
+
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((host, port))
-            s.sendall(b"upload")
-            response = s.recv(BUFFER_SIZE)
-            if response != b"UPLOAD_READY":
-                print("Сервер не готовий прийняти файл.")
-                return
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
 
-            filename = os.path.basename(file_path)
-            s.sendall(filename.encode())
-            response = s.recv(BUFFER_SIZE)
-            if response != b"FILENAME_RECEIVED":
-                print("Сервер не підтвердив отримання імені файлу.")
-                return
+        # Створення папки, якщо її немає
+        folder_path = os.path.dirname(file_path)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
 
-            file_size = os.path.getsize(file_path)
-            s.sendall(str(file_size).encode())
-            response = s.recv(BUFFER_SIZE)
-            if response != b"SIZE_RECEIVED":
-                print("Сервер не підтвердив отримання розміру файлу.")
-                return
+        # Замінюємо небажані символи в іменах файлів
+        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
 
-            with open(file_path, "rb") as file:
-                sent_size = 0
-                while chunk := file.read(BUFFER_SIZE):
-                    s.sendall(chunk)
-                    sent_size += len(chunk)
-                    if update_progress_callback:
-                        update_progress_callback(sent_size / file_size)
-            print("Файл успішно завантажено на сервер")
+        # Вивести прогрес завантаження
+        with open(file_path, "rb") as file:
+            sent_size = 0
+            while chunk := file.read(BUFFER_SIZE):
+                sent_size += len(chunk)
+                if update_progress_callback:
+                    update_progress_callback(sent_size / file_size)
+            print(f"Файл {safe_filename} успішно завантажено локально (розмір: {file_size} байт)")
+
     except Exception as e:
         print(f"Помилка при завантаженні файлу: {e}")
- 

@@ -1,3 +1,7 @@
 venv 
 downloads
 __pycache__
+config.json
+favorites.json
+down
+project_directory

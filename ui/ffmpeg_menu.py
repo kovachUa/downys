@@ -47,15 +47,25 @@ class FFmpegMenu(Gtk.Dialog):
         self.format_combo.set_active(1)  # Default to mp3
         grid.attach(self.format_combo, 1, 4, 1, 1)
 
+        # Audio codec selector
+        self.audio_codec_label = Gtk.Label(label="Audio Codec:")
+        grid.attach(self.audio_codec_label, 0, 5, 1, 1)
+
+        self.audio_codec_combo = Gtk.ComboBoxText()
+        self.audio_codec_combo.append_text("aac")
+        self.audio_codec_combo.append_text("mp3")
+        self.audio_codec_combo.set_active(0)  # Default to aac
+        grid.attach(self.audio_codec_combo, 1, 5, 1, 1)
+
         # Convert button
         self.convert_button = Gtk.Button(label="Convert")
         self.convert_button.connect("clicked", self.on_convert_clicked)
-        grid.attach(self.convert_button, 0, 5, 2, 1)
+        grid.attach(self.convert_button, 0, 6, 2, 1)
 
         # Cancel button
         self.cancel_button = Gtk.Button(label="Cancel")
         self.cancel_button.connect("clicked", self.on_cancel_clicked)
-        grid.attach(self.cancel_button, 0, 6, 2, 1)
+        grid.attach(self.cancel_button, 0, 7, 2, 1)
 
         self.show_all()
 
@@ -98,12 +108,16 @@ class FFmpegMenu(Gtk.Dialog):
 
         input_file = self.input_file
         output_format = self.format_combo.get_active_text()
+        audio_codec = self.audio_codec_combo.get_active_text()
         output_file_name = f"{os.path.splitext(os.path.basename(input_file))[0]}.{output_format}"
         output_file = os.path.join(self.output_folder, output_file_name)
 
         try:
             # Perform conversion using ffmpeg-python
-            ffmpeg.input(input_file).output(output_file).run(overwrite_output=True)
+            if output_format == 'mp3':
+                ffmpeg.input(input_file).output(output_file, acodec=audio_codec).run(overwrite_output=True)
+            else:
+                ffmpeg.input(input_file).output(output_file).run(overwrite_output=True)
             self.show_info(f"File successfully converted to: {output_file}")
         except ffmpeg.Error as e:
             self.show_warning(f"Error during conversion: {e}")
@@ -134,3 +148,4 @@ class FFmpegMenu(Gtk.Dialog):
         dialog.format_secondary_text(message)
         dialog.run()
         dialog.destroy()
+
