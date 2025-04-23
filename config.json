@@ -1,1 +1,4 @@
-{"host": "127.0.0.1", "port": 65000, "sleep_interval": 0.02, "max_sleep_interval": 0.05, "output_dir": "./down"}
+{
+    "host": "localhost",
+    "port": 12345
+}

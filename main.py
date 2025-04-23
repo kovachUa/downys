@@ -1,197 +1,452 @@
 import gi
-import json
-from pathlib import Path
-from gi.repository import Gtk
-from scripts import youtube
-from scripts.upload_server import upload_file_to_server
-from ui.ffmpeg_menu import FFmpegMenu
+import os
+import json # Keep if needed elsewhere, not used in provided snippets
+import subprocess # Keep if needed elsewhere, not used in provided snippets
+import re # Keep if needed elsewhere, not used in provided snippets
+import shutil # Keep if needed elsewhere, not used in provided snippets
+import threading
+from urllib.parse import urlparse # Keep if needed elsewhere, not used in provided snippets
+import time # Added for dummy task
 
 gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Pango
 
-BUFFER_SIZE = 4096
-CONFIG_FILE = "config.json"
+# Assume these scripts and menus exist
+from scripts.youtube import download_youtube_video_with_progress
+from scripts.upload_server import upload_file_to_server
+from ui.ffmpeg_menu import FFmpegMenu, FFMPEG_TASKS
+from ui.httrack_menu import HTTrackMenu
+from ui.youtube_menu import YouTubeMenu
+from scripts.httrack_tasks import run_httrack_web_threaded, archive_directory_threaded
 
-class DownysApp(Gtk.Window):
+# --- Dummy FFmpeg Task (Replace with actual implementation) ---
+def run_ffmpeg_task(input_path, output_path, task_type=None, task_options=None, progress_callback=None, status_callback=None):
+    # Ensure callbacks are called via GLib.idle_add as this runs in a separate thread
+    if status_callback:
+        GLib.idle_add(status_callback, f"Запуск FFmpeg завдання '{task_type}'...")
+    print(f"Dummy FFmpeg Task: {task_type}, Input: {input_path}, Output: {output_path}, Options: {task_options}")
+
+    # Simulate work and progress
+    total_steps = 100
+    for i in range(total_steps + 1):
+        # Ensure all UI-updating calls go through GLib.idle_add
+        if status_callback:
+            if i == 0:
+                GLib.idle_add(status_callback, "Ініціалізація FFmpeg...")
+            elif i == total_steps:
+                 GLib.idle_add(status_callback, "Завершення FFmpeg...")
+            elif i % 20 == 0:
+                 GLib.idle_add(status_callback, f"Обробка {i}%...")
+
+        if progress_callback:
+            GLib.idle_add(progress_callback, i / total_steps)
+
+        time.sleep(0.05) # Simulate work
+
+    if status_callback:
+        GLib.idle_add(status_callback, "FFmpeg завдання завершено.")
+
+
+class AppWindow(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Downys")
-        self.set_default_size(400, 250)
-        self.set_resizable(False)
+        Gtk.Window.__init__(self, title="Multi-Tool App")
+        self.set_default_size(800, 600)
 
-        # Load server configuration
-        self.host, self.port, self.sleep_interval, self.max_sleep_interval, self.output_dir = self.load_server_config()
+        self.host = "127.0.0.1" # Placeholder host
+        self.port = 12345       # Placeholder port
 
-        # Initialize the favorites list
-        self.favorites = self.load_favorites()
+        # --- UI Elements ---
+        header_bar = Gtk.HeaderBar()
+        header_bar.set_show_close_button(True)
+        header_bar.props.title = "Multi-Tool"
+        self.set_titlebar(header_bar)
 
-        # Main UI layout
-        grid = Gtk.Grid(column_spacing=10, row_spacing=5)
-        self.add(grid)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add(box)
 
-        # URL input field
-        self.url_entry = Gtk.Entry()
-        grid.attach(self.create_label("URL:"), 0, 0, 1, 1)
-        grid.attach(self.url_entry, 1, 0, 2, 1)
+        # Store stack and stack_sidebar as instance attributes
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(300)
 
-        # Buttons
-        self.httrack_button = self.create_button("HTTrack", self.on_httrack_clicked)
-        grid.attach(self.httrack_button, 0, 1, 1, 1)
+        self.stack_sidebar = Gtk.StackSidebar()
+        self.stack_sidebar.set_stack(self.stack)
 
-        self.youtube_button = self.create_button("YouTube", self.on_youtube_clicked)
-        grid.attach(self.youtube_button, 1, 1, 1, 1)
+        hbox_main = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hbox_main.set_homogeneous(False)
+        hbox_main.pack_start(self.stack_sidebar, False, False, 0) # Use self.stack_sidebar
+        hbox_main.pack_start(self.stack, True, True, 0) # Use self.stack
+        box.pack_start(hbox_main, True, True, 0)
 
-        self.upload_button = self.create_button("Завантажити на сервер", self.on_upload_clicked)
-        grid.attach(self.upload_button, 2, 1, 1, 1)
+        # --- Pages ---
+        self._create_youtube_page()
+        self._create_ffmpeg_page()
+        self._create_httrack_page()
+        self._create_upload_page()
+        self._create_about_page() # Placeholder About page
 
-        self.ffmpeg_button = self.create_button("FFmpeg", self.on_ffmpeg_clicked)
-        grid.attach(self.ffmpeg_button, 1, 2, 1, 1)
+        # --- Status and Progress Bar ---
+        status_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.pack_end(status_hbox, False, False, 0)
 
-        # Progress bar
+        self.status_label = Gtk.Label(label="Готово.")
+        self.status_label.set_halign(Gtk.Align.START)
+        self.status_label.set_line_wrap(True)
+        self.status_label.set_max_width_chars(80) # Limit width to prevent excessive wrapping
+        self.status_label.set_ellipsize(Pango.EllipsizeMode.END) # Add ellipsis if text is too long
+        status_hbox.pack_start(self.status_label, True, True, 0)
+
         self.progress_bar = Gtk.ProgressBar()
-        grid.attach(self.progress_bar, 0, 3, 3, 1)
+        self.progress_bar.set_fraction(0.0)
+        self.progress_bar.set_text("")
+        self.progress_bar.set_show_text(True)
+        status_hbox.pack_end(self.progress_bar, False, False, 0) # Use pack_end for right alignment
 
-        # Settings button
-        self.settings_button = Gtk.Button(label="Налаштування")
-        self.settings_button.connect("clicked", self.on_server_settings_clicked)
-        grid.attach(self.settings_button, 0, 4, 1, 1)
+        # --- Task Management ---
+        self._is_task_running = False
+        self._current_task_thread = None
 
-    def create_label(self, text):
-        return Gtk.Label(label=text)
+        # Show window
+        self.connect("destroy", Gtk.main_quit)
+        self.show_all()
 
-    def create_button(self, label, handler):
-        button = Gtk.Button(label=label)
-        button.connect("clicked", handler)
-        return button
+    # --- Page Creation Methods ---
+    def _create_youtube_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(10)
+        # Use Pango markup for bold and large text
+        page.pack_start(Gtk.Label(label="<b><big>Завантаження YouTube</big></b>", use_markup=True), False, False, 0)
+        button = Gtk.Button(label="Налаштувати та завантажити")
+        button.connect("clicked", self.on_youtube_clicked)
+        page.pack_start(button, False, False, 0)
+        self.stack.add_titled(page, "youtube_page", "YouTube")
 
-    # Button actions
-    def on_httrack_clicked(self, widget):
-        self.run_httrack_script()
+    def _create_ffmpeg_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(10)
+        # Use Pango markup for bold and large text
+        page.pack_start(Gtk.Label(label="<b><big>FFmpeg Конвертація</big></b>", use_markup=True), False, False, 0)
+        button = Gtk.Button(label="Налаштувати та виконати")
+        button.connect("clicked", self.on_ffmpeg_clicked)
+        page.pack_start(button, False, False, 0)
+        self.stack.add_titled(page, "ffmpeg_page", "FFmpeg")
 
+    def _create_httrack_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(10)
+        # Use Pango markup for bold and large text
+        page.pack_start(Gtk.Label(label="<b><big>HTTrack та Архівування</big></b>", use_markup=True), False, False, 0)
+        button = Gtk.Button(label="Налаштувати та виконати")
+        button.connect("clicked", self.on_httrack_clicked)
+        page.pack_start(button, False, False, 0)
+        self.stack.add_titled(page, "httrack_page", "HTTrack/Архів")
+
+    def _create_upload_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(10)
+        # Use Pango markup for bold and large text
+        page.pack_start(Gtk.Label(label="<b><big>Завантаження на Сервер</big></b>", use_markup=True), False, False, 0)
+        button = Gtk.Button(label="Обрати файл та завантажити")
+        button.connect("clicked", self.on_upload_clicked)
+        page.pack_start(button, False, False, 0)
+        self.stack.add_titled(page, "upload_page", "Завантаження")
+
+    def _create_about_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(10)
+        # Use Pango markup for bold and large text
+        page.pack_start(Gtk.Label(label="<b><big>Про програму</big></b>", use_markup=True), False, False, 0)
+        page.pack_start(Gtk.Label(label="Це багатофункціональна програма для роботи з контентом."), False, False, 0)
+        # Add more info here
+        self.stack.add_titled(page, "about_page", "Про програму")
+
+
+    # --- Dialog Callbacks ---
     def on_youtube_clicked(self, widget):
-        self.run_youtube_script()
-
-    def on_upload_clicked(self, widget):
-        self.run_upload_script()
-
-    def on_ffmpeg_clicked(self, widget):
-        ffmpeg_menu = FFmpegMenu(self)
-        ffmpeg_menu.show_all()
-
-    def on_server_settings_clicked(self, widget):
-        dialog = Gtk.Dialog("Налаштування сервера", self, Gtk.DialogFlags.MODAL,
-                            ("Скасувати", Gtk.ResponseType.CANCEL, "Зберегти", Gtk.ResponseType.OK))
-        dialog.set_default_size(300, 200)
-
-        # Fields for server settings
-        host_entry = Gtk.Entry(text=self.host)
-        port_entry = Gtk.Entry(text=str(self.port))
-        sleep_interval_entry = Gtk.Entry(text=str(self.sleep_interval))
-        max_sleep_interval_entry = Gtk.Entry(text=str(self.max_sleep_interval))
-        output_dir_entry = Gtk.Entry(text=self.output_dir)
-
-        box = dialog.get_content_area()
-        box.add(self.create_label("Адреса сервера:"))
-        box.add(host_entry)
-        box.add(self.create_label("Порт сервера:"))
-        box.add(port_entry)
-        box.add(self.create_label("Інтервал (с):"))
-        box.add(sleep_interval_entry)
-        box.add(self.create_label("Макс. інтервал (с):"))
-        box.add(max_sleep_interval_entry)
-        box.add(self.create_label("Папка для завантажень:"))
-        box.add(output_dir_entry)
-
-        dialog.show_all()
-
+        dialog = YouTubeMenu(self)
         response = dialog.run()
+
         if response == Gtk.ResponseType.OK:
-            self.host = host_entry.get_text().strip()
-            self.port = int(port_entry.get_text().strip())
-            self.sleep_interval = float(sleep_interval_entry.get_text().strip())
-            self.max_sleep_interval = float(max_sleep_interval_entry.get_text().strip())
-            self.output_dir = output_dir_entry.get_text().strip()
-            self.save_server_config(self.host, self.port, self.sleep_interval, self.max_sleep_interval, self.output_dir)
+            try:
+                url, output_dir = dialog.get_params()
+                # Pass the task function and its arguments/kwargs to _start_task
+                self._start_task(
+                    download_youtube_video_with_progress,
+                    args=(url, output_dir),
+                    # Callbacks are added by _start_task's internal logic based on task_func type
+                )
+            except ValueError as e:
+                self.show_warning_dialog(str(e))
+            except Exception as e:
+                self.show_warning_dialog(f"Неочікувана помилка при отриманні параметрів: {e}")
+
         dialog.destroy()
 
-    # Script logic
-    def run_httrack_script(self):
-        from scripts import httrack
-        httrack.run_httrack()
+    def on_ffmpeg_clicked(self, widget):
+        dialog = FFmpegMenu(self)
+        response = dialog.run()
 
-    def run_youtube_script(self):
-        url = self.url_entry.get_text().strip()
-        if not url:
-            self.show_warning_dialog("Будь ласка, введіть URL.")
-            return
+        if response == Gtk.ResponseType.OK:
+            try:
+                params = dialog.get_params()
+                # Pass the task function and its arguments/kwargs to _start_task
+                self._start_task(
+                    run_ffmpeg_task, # Use the dummy or actual FFmpeg task function
+                    args=(params['input_path'], params['output_path']),
+                    kwargs={'task_type': params['task_type'], 'task_options': params['task_options']}
+                    # Callbacks are added by _start_task's internal logic based on task_func type
+                )
+            except ValueError as e:
+                self.show_warning_dialog(str(e))
+            except Exception as e:
+                self.show_warning_dialog(f"Неочікувана помилка при отриманні параметрів: {e}")
 
-        result = youtube.download_youtube_video(url)
-        
-        # Перевірка результату
-        if result and isinstance(result, tuple) and len(result) == 2:
-            uploader, title = result
-            uploader = uploader or "Unknown_Uploader"
-            title = title or "Unknown_Title"
+        dialog.destroy()
 
-            video_path = f'{self.output_dir}/{uploader}/{title}.mp4'
-            upload_file_to_server(self.host, self.port, video_path)
+    def on_httrack_clicked(self, widget):
+        dialog = HTTrackMenu(self)
+        response = dialog.run()
 
-            # Показуємо тільки повідомлення про успішне завантаження
-            self.show_info_dialog(f"Відео '{title}' успішно завантажено!")
-        else:
-            # Показуємо повідомлення про помилку тільки якщо результат некоректний
-            self.show_warning_dialog("Відео завантаженно.")
+        if response == Gtk.ResponseType.OK:
+            try:
+                params = dialog.get_params()
+                operation_type = params["operation_type"]
 
-    def run_upload_script(self):
-        dialog = Gtk.FileChooserDialog("Оберіть файл для завантаження", self, Gtk.FileChooserAction.OPEN,
-                                       ("Скасувати", Gtk.ResponseType.CANCEL, "Відкрити", Gtk.ResponseType.OK))
+                if operation_type == "mirror":
+                    url = params["url"]
+                    mirror_output_dir = params["mirror_output_dir"]
+                    archive_after_mirror = params["archive_after_mirror"]
+                    post_mirror_archive_path = params["post_mirror_archive_path"]
+
+                    # The main task is HTTrack mirroring
+                    # Pass archiving parameters for the wrapper to use later
+                    self._start_task(
+                        run_httrack_web_threaded,
+                        args=(url, mirror_output_dir),
+                        kwargs={'archive_after_mirror': archive_after_mirror,
+                                'post_mirror_archive_path': post_mirror_archive_path,
+                                'mirror_output_dir': mirror_output_dir, # Need this again for archiving
+                                'site_url': url # Pass url for archive function to potentially find subdir
+                               }
+                        # status_callback is added by _start_task's internal logic
+                    )
+
+                elif operation_type == "archive":
+                    archive_source_dir = params["archive_source_dir"]
+                    archive_path = params["archive_path"]
+                    # Direct archive task
+                    self._start_task(
+                        archive_directory_threaded,
+                        args=(archive_source_dir, archive_path),
+                        kwargs={'site_url': None, # No URL source in this mode
+                                'site_subdir_name': None # No explicit subdir in this mode
+                               }
+                        # status_callback is added by _start_task's internal logic
+                    )
+
+            except ValueError as e:
+                self.show_warning_dialog(str(e))
+            except Exception as e:
+                 self.show_warning_dialog(f"Неочікувана помилка при отриманні параметрів: {e}")
+
+
+        dialog.destroy()
+
+    def on_upload_clicked(self, widget):
+        dialog = Gtk.FileChooserDialog(
+            "Оберіть файл для завантаження", self,
+            Gtk.FileChooserAction.OPEN,
+            ("_Скасувати", Gtk.ResponseType.CANCEL,
+             "_Відкрити", Gtk.ResponseType.OK)
+        )
+
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             file_path = dialog.get_filename()
-            upload_file_to_server(self.host, self.port, file_path)
-        dialog.destroy()
+            dialog.destroy()
 
+            if not file_path or not os.path.isfile(file_path):
+                 self.show_warning_dialog("Будь ласка, оберіть існуючий файл.")
+                 return
+
+            try:
+                # Pass the task function and its arguments/kwargs to _start_task
+                self._start_task(
+                    upload_file_to_server,
+                    args=(file_path,),
+                    kwargs={'host': self.host, 'port': self.port}
+                    # update_progress_callback is added by _start_task's internal logic
+                )
+            except Exception as e:
+                 # Should be caught by _start_task wrapper, but safety first
+                 self.show_warning_dialog(f"Неочікувана помилка перед запуском завантаження: {e}")
+
+        else:
+            dialog.destroy()
+
+    # --- Task Execution and Callbacks ---
+
+    def _set_controls_sensitive(self, sensitive):
+        # This method is called from the main thread
+        # Disable buttons on stack pages (iterate through stack children)
+        for page in self.stack.get_children(): # Use self.stack
+             # Iterate through potential containers within the page
+             # For simplicity, let's just find buttons directly under the page container
+             # A recursive function would be needed for deeply nested buttons
+             if hasattr(page, 'get_children'):
+                 for child in page.get_children():
+                     if isinstance(child, Gtk.Button):
+                          child.set_sensitive(sensitive)
+
+
+        # Disable buttons within the StackSidebar / StackSwitcher
+        # Accessing the StackSwitcher directly is still slightly fragile
+        # but more reliable than iterating arbitrary sidebar children.
+        # StackSwitcher is often a direct child of the StackSidebar.
+        if hasattr(self.stack_sidebar, 'get_children'):
+            for sidebar_child in self.stack_sidebar.get_children(): # Use self.stack_sidebar
+                 if isinstance(sidebar_child, Gtk.StackSwitcher):
+                      # Found the switcher, now iterate its children (the buttons)
+                      if hasattr(sidebar_child, 'get_children'):
+                          for switcher_button in sidebar_child.get_children():
+                              # Check if the child of StackSwitcher is a button-like element
+                               if hasattr(switcher_button, 'set_sensitive'):
+                                    switcher_button.set_sensitive(sensitive)
+
+        # Note: Disabling controls in open dialogs (_on_youtube_clicked etc.) requires managing
+        # the dialog instances themselves or using a global input grab (less ideal).
+        # For this scope, disabling main window controls is sufficient.
+
+
+    def _update_progress(self, fraction):
+        # This method is called from the task thread via GLib.idle_add (or directly by task if it does the wrapping)
+        self.progress_bar.set_fraction(fraction)
+        # Only show percentage text if progress is non-zero or complete
+        self.progress_bar.set_text(f"{int(fraction*100)}%") if fraction > 0 or fraction == 1.0 else self.progress_bar.set_text("")
+
+
+    def _update_status(self, message):
+        # This method is called from the task thread via GLib.idle_add (or directly by task if it does the wrapping)
+        self.status_label.set_text(message)
+
+    def _on_task_complete(self):
+        # This method is called from the task thread via GLib.idle_add
+        self._is_task_running = False
+        GLib.idle_add(self._set_controls_sensitive, True) # Ensure sensitivity is updated on main thread
+        GLib.idle_add(self._update_progress, 1.0) # Ensure progress is full on success on main thread
+        GLib.idle_add(self._update_status, "Завдання завершено.") # Update status on main thread
+        print("Task Completed.") # Log to console as well
+
+    def _on_task_error(self, error_message):
+        # This method is called from the task thread via GLib.idle_add
+        self._is_task_running = False
+        GLib.idle_add(self._set_controls_sensitive, True) # Ensure sensitivity is updated on main thread
+        # Keep progress bar at last state or reset? Let's reset for clarity on failure
+        GLib.idle_add(self._update_progress, 0.0) # Reset progress on main thread
+        GLib.idle_add(self._update_status, f"Помилка: {error_message}") # Update status on main thread
+        print(f"Task Error: {error_message}") # Log to console as well
+        # Show dialog on main thread
+        GLib.idle_add(self.show_warning_dialog, f"Під час виконання завдання сталася помилка:\n{error_message}")
+
+
+    def _start_task(self, task_func, args=(), kwargs=None):
+        if self._is_task_running:
+            self.show_warning_dialog("Завдання вже виконується. Будь ласка, дочекайтеся його завершення.")
+            return
+
+        self._is_task_running = True
+        # Update UI on the main thread
+        GLib.idle_add(self._set_controls_sensitive, False)
+        GLib.idle_add(self._update_progress, 0.0)
+        GLib.idle_add(self._update_status, "Запуск завдання...")
+
+
+        if kwargs is None:
+             kwargs = {}
+
+        # Prepare kwargs to pass to the task function, including callbacks
+        # Task functions are expected to wrap their callback calls with GLib.idle_add.
+        task_kwargs = kwargs.copy()
+
+        # Pass the methods as callbacks.
+        task_kwargs['status_callback'] = self._update_status
+        # Determine which tasks get a progress callback
+        tasks_with_progress = [download_youtube_video_with_progress, run_ffmpeg_task, upload_file_to_server]
+        if task_func in tasks_with_progress:
+             # upload_file_to_server expects 'update_progress_callback' name
+             if task_func == upload_file_to_server:
+                 task_kwargs['update_progress_callback'] = self._update_progress
+             else: # youtube, ffmpeg
+                 task_kwargs['progress_callback'] = self._update_progress
+        # HTTrack tasks do not have a clear progress indication, only status updates
+
+
+        def wrapper():
+            try:
+                # Execute the primary task
+                print(f"Starting thread for: {task_func.__name__}")
+                # Note: Pass *args and **task_kwargs to the task function
+                task_func(*args, **task_kwargs)
+                print(f"Primary task finished: {task_func.__name__}")
+
+                # --- Handle Sequential Tasks (e.g., Archive after HTTrack Mirror) ---
+                # This sequence logic is specific to the HTTrack mirror task
+                if task_func == run_httrack_web_threaded and kwargs.get('archive_after_mirror'):
+                     mirror_output_dir = kwargs.get('mirror_output_dir') # Use kwargs directly from the initial call
+                     post_mirror_archive_path = kwargs.get('post_mirror_archive_path')
+                     site_url = kwargs.get('site_url')
+
+                     if mirror_output_dir and post_mirror_archive_path:
+                         # Update status on the main thread before starting the next step
+                         GLib.idle_add(self._update_status, "HTTrack завершено. Запуск архівації результату...")
+                         print("Starting post-mirror archive...")
+                         try:
+                             # Call archive_directory_threaded. It expects status_callback and optional site_url/subdir.
+                             # It must also wrap its status_callback calls with GLib.idle_add.
+                             archive_directory_threaded(
+                                 mirror_output_dir,
+                                 post_mirror_archive_path,
+                                 status_callback=self._update_status, # Pass status callback
+                                 site_url=site_url # Pass original URL to help find subdir
+                             )
+                             print("Post-mirror archive finished.")
+                         except Exception as archive_e:
+                              # If archive fails, report archive error, but the main task (HTTrack) finished.
+                              # We report this as an error for the overall operation sequence.
+                              GLib.idle_add(self._on_task_error, f"Помилка під час архівації результату HTTrack: {archive_e}")
+                              return # Stop here on archive error
+
+                # If we reached here, the primary task (and optional sequence) succeeded
+                GLib.idle_add(self._on_task_complete)
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc() # Print detailed traceback to console
+                GLib.idle_add(self._on_task_error, str(e))
+
+        thread = threading.Thread(target=wrapper)
+        # thread.daemon = True # Keeping the application alive until tasks finish is safer for debugging
+        thread.start()
+        self._current_task_thread = thread
+
+
+    # --- Utility Methods ---
     def show_warning_dialog(self, message):
-        dialog = Gtk.MessageDialog(self, modal=True, message_type=Gtk.MessageType.WARNING,
-                                   buttons=Gtk.ButtonsType.OK, text=message)
+        # This method should only be called from the main thread
+        # Using modern keyword arguments for Gtk.MessageDialog
+        dialog = Gtk.MessageDialog(
+            parent=self,
+            modal=True,
+            destroy_with_parent=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK,
+            text=message # Using the recommended 'text' keyword
+        )
         dialog.run()
         dialog.destroy()
 
-    def show_info_dialog(self, message):
-        dialog = Gtk.MessageDialog(self, modal=True, message_type=Gtk.MessageType.INFO,
-                                   buttons=Gtk.ButtonsType.OK, text=message)
-        dialog.run()
-        dialog.destroy()
 
-    def load_server_config(self):
-        config_file = Path(CONFIG_FILE)
-        if config_file.exists():
-            with config_file.open("r") as f:
-                config = json.load(f)
-                return config.get("host", "localhost"), config.get("port", 12345), config.get("sleep_interval", 0.02), config.get("max_sleep_interval", 0.05), config.get("output_dir", "./downloads")
-        return "localhost", 12345, 0.02, 0.05, "./downloads"
-
-    def save_server_config(self, host, port, sleep_interval, max_sleep_interval, output_dir):
-        config = {
-            "host": host,
-            "port": port,
-            "sleep_interval": sleep_interval,
-            "max_sleep_interval": max_sleep_interval,
-            "output_dir": output_dir
-        }
-        with Path(CONFIG_FILE).open("w") as f:
-            json.dump(config, f)
-
-    def load_favorites(self):
-        favorites_file = Path("favorites.json")
-        if favorites_file.exists():
-            with favorites_file.open("r") as f:
-                try:
-                    return json.load(f)
-                except json.JSONDecodeError:
-                    return []
-        return []
-
+# --- Main Execution ---
 if __name__ == "__main__":
-    app = DownysApp()
-    app.connect("destroy", Gtk.main_quit)
-    app.show_all()
+    win = AppWindow()
     Gtk.main()

@@ -1,32 +1,58 @@
 import os
-import re
-from tqdm import tqdm
+import socket
+from gi.repository import GLib # Import GLib
 
 BUFFER_SIZE = 4096
 
 def upload_file_to_server(host, port, file_path, update_progress_callback=None):
-    print("Завантаження файлу локально...")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    file_size = os.path.getsize(file_path)
 
     try:
-        filename = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
 
-        # Створення папки, якщо її немає
-        folder_path = os.path.dirname(file_path)
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+            s.sendall(b"upload")
+            response = s.recv(BUFFER_SIZE)
+            if response != b"UPLOAD_READY":
+                raise RuntimeError(f"Сервер не готовий до завантаження. Відповідь: {response.decode(errors='ignore')}")
 
-        # Замінюємо небажані символи в іменах файлів
-        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+            filename = os.path.basename(file_path)
+            s.sendall(filename.encode())
+            response = s.recv(BUFFER_SIZE)
+            if response != b"FILENAME_RECEIVED":
+                raise RuntimeError(f"Сервер не підтвердив отримання імені файлу. Відповідь: {response.decode(errors='ignore')}")
 
-        # Вивести прогрес завантаження
-        with open(file_path, "rb") as file:
+            s.sendall(str(file_size).encode())
+            response = s.recv(BUFFER_SIZE)
+            if response != b"SIZE_RECEIVED":
+                 raise RuntimeError(f"Сервер не підтвердив отримання розміру файлу. Відповідь: {response.decode(errors='ignore')}")
+
             sent_size = 0
-            while chunk := file.read(BUFFER_SIZE):
-                sent_size += len(chunk)
-                if update_progress_callback:
-                    update_progress_callback(sent_size / file_size)
-            print(f"Файл {safe_filename} успішно завантажено локально (розмір: {file_size} байт)")
+            with open(file_path, "rb") as file:
+                while True:
+                    chunk = file.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    s.sendall(chunk)
+                    sent_size += len(chunk)
 
+                    if update_progress_callback:
+                        fraction = sent_size / file_size
+                        # Use GLib.idle_add to safely update UI from thread
+                        GLib.idle_add(update_progress_callback, fraction)
+
+            # Send confirmation or wait for server confirmation if needed
+            # For simplicity, assuming sending all data is success confirmation
+
+            return True
+
+    except ConnectionRefusedError:
+        raise RuntimeError(f"Помилка: Не вдалося підключитись до сервера за адресою {host}:{port}. Переконайтеся, що сервер запущений.")
+    except FileNotFoundError:
+        # This is checked at the beginning, but keeping it for completeness
+        raise FileNotFoundError(f"Файл для завантаження не знайдено: {file_path}")
     except Exception as e:
-        print(f"Помилка при завантаженні файлу: {e}")
+        raise RuntimeError(f"Помилка під час завантаження на сервер: {e}")
