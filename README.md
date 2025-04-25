@@ -2,7 +2,7 @@
 # DownYS
 
 <p align="center">
-  <img src="Screenshot1.png" alt="Скріншот головного вікна DownYS" width="500"/>
+  <img src="img/Screenshot1.png" alt="Скріншот головного вікна DownYS" width="500"/>
 </p>
 
 **Багатофункціональний інструмент для роботи з контентом з графічним інтерфейсом (GUI).**
