@@ -1,5 +1,3 @@
-# --- START OF FILE bookmarks_page.py ---
-
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Pango
@@ -7,25 +5,25 @@ import os
 import json
 
 class BookmarksPage:
-    # ВИДАЛЕНО 'bookmarks_file_path' з аргументів конструктора
+
     def __init__(self, app_window, url_handler):
-        self.app = app_window # Зберігаємо посилання на головне вікно
-        self.url_handler = url_handler # Збережемо на випадок потреби
+        self.app = app_window 
+        self.url_handler = url_handler 
         self.page_widget = None
         self.listbox = None
         self.url_entry = None
         self.name_entry = None
         self.bookmarks = []
-        self.bookmarks_file = None # Ініціалізуємо шлях як None
-        self.path_label = None # Мітка для відображення шляху
-        self._path_checked = False # Прапорець, щоб не запитувати шлях постійно
+        self.bookmarks_file = None 
+        self.path_label = None 
+        self._path_checked = False 
         print("DEBUG: BookmarksPage initialized (path will be requested on action).")
 
     def _prompt_for_path(self):
         """Показує діалог вибору/створення файлу закладок."""
         dialog = Gtk.FileChooserDialog(
             title="Виберіть або створіть файл для закладок (.json)",
-            parent=self.app, # Використовуємо головне вікно як батьківське
+            parent=self.app, 
             action=Gtk.FileChooserAction.SAVE
         )
         dialog.add_buttons(
@@ -179,7 +177,6 @@ class BookmarksPage:
         try:
             with open(self.bookmarks_file, 'r', encoding='utf-8') as f:
                 loaded_data = json.load(f)
-            # Додаткова перевірка типу завантажених даних
             if isinstance(loaded_data, list):
                 self.bookmarks = [bm for bm in loaded_data if isinstance(bm, dict) and 'url' in bm]
                 print(f"DEBUG: Loaded and validated bookmarks: {len(self.bookmarks)} items")
@@ -192,7 +189,7 @@ class BookmarksPage:
             print(f"Помилка завантаження або валідації закладок з '{self.bookmarks_file}': {e}")
             self.bookmarks = []
             self.app.show_warning_dialog(f"Не вдалося завантажити закладки з файлу:\n{self.bookmarks_file}\n\nПомилка: {e}\n\nСписок буде порожнім.")
-        except Exception as e: # Ловимо інші можливі помилки
+        except Exception as e:
             print(f"Неочікувана помилка при завантаженні закладок: {e}")
             self.bookmarks = []
             self.app.show_warning_dialog(f"Неочікувана помилка при завантаженні закладок:\n{e}")
@@ -222,7 +219,6 @@ class BookmarksPage:
 
     def populate_listbox(self):
         print(f"DEBUG: Populating listbox. Have {len(self.bookmarks)} bookmarks.")
-        # Захист від спроби доступу до listbox до його створення
         if not hasattr(self, 'listbox') or not self.listbox:
              print("Warning: populate_listbox called before listbox is created.")
              return
@@ -288,7 +284,6 @@ class BookmarksPage:
         self.bookmarks.append(new_bookmark)
         self.save_bookmarks()
         self.populate_listbox()
-        # Очистка полів після успішного додавання
         if hasattr(self, 'url_entry') and self.url_entry: self.url_entry.set_text("")
         if hasattr(self, 'name_entry') and self.name_entry: self.name_entry.set_text("")
 
@@ -309,7 +304,7 @@ class BookmarksPage:
             else:
                 print(f"ERROR: Invalid bookmark index {index_to_remove} for removal. Current bookmark count: {len(self.bookmarks)}")
                 self.app.show_warning_dialog("Помилка: Не вдалося видалити закладку (некоректний індекс).")
-                self.populate_listbox() # Оновлюємо на випадок помилки
+                self.populate_listbox()
         else:
              if self.bookmarks_file:
                 self.app.show_warning_dialog("Будь ласка, виберіть закладку для видалення.")
@@ -344,5 +339,3 @@ class BookmarksPage:
 
     def get_page_widget(self):
          return self.page_widget
-
-# --- END OF FILE bookmarks_page.py ---

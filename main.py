@@ -1,5 +1,3 @@
-# --- START OF FILE main.py ---
-
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Pango
@@ -14,7 +12,6 @@ import time
 import datetime
 import pprint
 
-# Імпорт модулів зі скриптів
 try:
     from scripts.youtube import download_youtube_video_with_progress
     from scripts.upload_server import upload_file_to_server
@@ -25,13 +22,10 @@ except ImportError as e:
      print("Переконайтеся, що файли *.py знаходяться в папці 'scripts' поруч з main.py")
      exit(1)
 
-# Імпорт сторінки закладок
 try:
-    # Припускаємо, що bookmarks_page.py тепер у папці scripts
     from scripts.bookmarks_page import BookmarksPage
 except ImportError:
     try:
-        # Якщо не в scripts, шукаємо поруч
         from bookmarks_page import BookmarksPage
     except ImportError as e:
          print(f"Помилка імпорту BookmarksPage: {e}")
@@ -684,7 +678,7 @@ class AboutPage(BasePage):
  - Завантаження відео з YouTube (yt-dlp) з вибором формату та субтитрів
  - Конвертація відео/аудіо (FFmpeg)
  - Віддзеркалення веб-сайтів (HTTrack)
- - Архівування директорій (tar.gz, zip, ...)
+ - Архівування директорій (tar.gz)
  - Завантаження файлів на простий TCP сервер
  - Збереження URL у закладках (з можливістю вибору файлу)
 <b>Вимоги:</b> Python 3.x, PyGObject (GTK 3), yt-dlp, FFmpeg, HTTrack
@@ -722,7 +716,6 @@ class AppWindow(Gtk.Window):
             ("about", "Про програму", AboutPage),
         ]
         for name, title, page_class in page_definitions:
-             # Тепер всі сторінки створюються однаково
              page_instance = page_class(self, self.url_handler)
 
              page_widget = page_instance.build_ui()
@@ -898,7 +891,7 @@ class AppWindow(Gtk.Window):
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             selected_path = dialog.get_filename(); entry_widget.set_text(selected_path)
-            if page_instance and current_page_name != "bookmarks": # Оновлення тільки для інших сторінок
+            if page_instance and current_page_name != "bookmarks": 
                  try:
                      if current_page_name == "ffmpeg" and hasattr(page_instance, '_update_output_suggestion') and entry_widget == getattr(page_instance, 'input_entry', None): page_instance._update_output_suggestion()
                      elif current_page_name == "httrack":
@@ -939,7 +932,6 @@ class AppWindow(Gtk.Window):
         dialog.destroy()
 
 if __name__ == "__main__":
-    # Перевірка залежностей
     missing_deps = []
     try: subprocess.run(['ffmpeg', '-version'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (FileNotFoundError, subprocess.CalledProcessError): missing_deps.append("FFmpeg")
@@ -961,4 +953,3 @@ if __name__ == "__main__":
     app = AppWindow()
     Gtk.main()
 
-# --- END OF FILE main.py ---
