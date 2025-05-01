@@ -1,3 +1,5 @@
+# --- START OF FILE bookmarks_page.py ---
+
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Pango
@@ -7,65 +9,49 @@ import json
 class BookmarksPage:
 
     def __init__(self, app_window, url_handler):
-        self.app = app_window 
-        self.url_handler = url_handler 
+        self.app = app_window
+        self.url_handler = url_handler
         self.page_widget = None
         self.listbox = None
         self.url_entry = None
         self.name_entry = None
         self.bookmarks = []
-        self.bookmarks_file = None 
-        self.path_label = None 
-        self._path_checked = False 
-        print("DEBUG: BookmarksPage initialized (path will be requested on action).")
+        self.path_label = None
 
-    def _prompt_for_path(self):
-        """Показує діалог вибору/створення файлу закладок."""
-        dialog = Gtk.FileChooserDialog(
-            title="Виберіть або створіть файл для закладок (.json)",
-            parent=self.app, 
-            action=Gtk.FileChooserAction.SAVE
-        )
-        dialog.add_buttons(
-            "_Скасувати", Gtk.ResponseType.CANCEL,
-            "_Обрати", Gtk.ResponseType.OK
-        )
-        dialog.set_do_overwrite_confirmation(False)
 
-        filter_json = Gtk.FileFilter()
-        filter_json.set_name("JSON файли")
-        filter_json.add_mime_type("application/json")
-        filter_json.add_pattern("*.json")
-        dialog.add_filter(filter_json)
-        filter_any = Gtk.FileFilter()
-        filter_any.set_name("Всі файли")
-        filter_any.add_pattern("*")
-        dialog.add_filter(filter_any)
-
-        default_dir = os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS) or GLib.get_home_dir(), "DownYS_Bookmarks")
-        default_name = "bookmarks.json"
         try:
-            os.makedirs(default_dir, exist_ok=True)
-            if os.path.isdir(default_dir):
-                 dialog.set_current_folder(default_dir)
-            else:
-                 dialog.set_current_folder(os.path.expanduser("~"))
-        except Exception as e:
-             print(f"Warning setting default folder in prompt: {e}")
-             dialog.set_current_folder(os.path.expanduser("~"))
-        dialog.set_current_name(default_name)
+            docs_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+            if not docs_dir: 
+                 docs_dir = GLib.get_home_dir()
+            self.default_bookmarks_dir = os.path.join(docs_dir, "DownYS_Bookmarks")
+        except Exception: 
+             self.default_bookmarks_dir = os.path.join(GLib.get_home_dir(), "DownYS_Bookmarks")
 
-        response = dialog.run()
-        chosen_path = None
-        if response == Gtk.ResponseType.OK:
-            chosen_path = dialog.get_filename()
-            if chosen_path and not chosen_path.lower().endswith(".json"):
-                chosen_path += ".json"
-        dialog.destroy()
-        return chosen_path
+        self.bookmarks_file = os.path.join(self.default_bookmarks_dir, "bookmarks.json")
+        print(f"DEBUG: Bookmarks will be loaded/saved to: {self.bookmarks_file}")
+
+        self._initialize_bookmarks() # Завантажуємо закладки при старті
+
+    def _initialize_bookmarks(self):
+        """Створює директорію (якщо потрібно) та завантажує закладки."""
+        try:
+            os.makedirs(self.default_bookmarks_dir, exist_ok=True)
+            print(f"DEBUG: Ensured bookmarks directory exists: {self.default_bookmarks_dir}")
+            self.load_bookmarks()
+        except OSError as e:
+            print(f"ERROR: Could not create or access bookmarks directory '{self.default_bookmarks_dir}': {e}")
+            self.app.show_warning_dialog(
+                f"Не вдалося створити або отримати доступ до папки закладок:\n{self.default_bookmarks_dir}\n\nПомилка: {e}\n\nЗбереження/завантаження може не працювати."
+            )
+            self.bookmarks = [] 
+        except Exception as e:
+             print(f"ERROR: Unexpected error during bookmark initialization: {e}")
+             self.app.show_warning_dialog(f"Неочікувана помилка ініціалізації закладок:\n{e}")
+             self.bookmarks = []
+
 
     def _update_path_label(self):
-        """Оновлює текст мітки шляху."""
+        """Оновлює текст мітки шляху, показуючи стандартний шлях."""
         if not self.path_label:
             return
         if self.bookmarks_file:
@@ -77,47 +63,9 @@ class BookmarksPage:
                  print(f"Error updating path label: {e}")
                  self.path_label.set_text("Помилка відображення шляху")
         else:
-             self.path_label.set_markup("<small>Файл закладок: <i>Не обрано</i></small>")
-             self.path_label.set_tooltip_text("Натисніть 'Додати' або 'Видалити', щоб обрати файл")
+             self.path_label.set_markup("<small>Файл закладок: <i>Не вдалося визначити</i></small>")
+             self.path_label.set_tooltip_text("Помилка визначення шляху до файлу закладок")
 
-    def _ensure_bookmarks_path(self):
-        """Перевіряє, чи встановлено шлях, і запитує користувача, якщо ні."""
-        if self.bookmarks_file and os.path.exists(os.path.dirname(self.bookmarks_file)):
-            self._path_checked = True
-            return True
-
-        if self._path_checked:
-             if not self.bookmarks_file:
-                  self.app.show_warning_dialog("Неможливо виконати дію: файл закладок не обрано.")
-             else:
-                  self.app.show_warning_dialog(f"Неможливо виконати дію: папка для файлу закладок недоступна:\n{os.path.dirname(self.bookmarks_file)}")
-             return False
-
-        print("DEBUG: Bookmarks file path is not set or invalid. Prompting user.")
-        chosen_path = self._prompt_for_path()
-        self._path_checked = True
-
-        if chosen_path:
-            try:
-                os.makedirs(os.path.dirname(chosen_path), exist_ok=True)
-                self.bookmarks_file = chosen_path
-                print(f"DEBUG: User selected bookmarks file: {self.bookmarks_file}")
-                self._update_path_label()
-                self.load_bookmarks()
-                self.populate_listbox()
-                return True
-            except OSError as e:
-                 print(f"ERROR: Could not create directory for chosen path '{chosen_path}': {e}")
-                 self.app.show_warning_dialog(f"Не вдалося створити папку для файлу:\n{os.path.dirname(chosen_path)}\n\nПомилка: {e}")
-                 self.bookmarks_file = None
-                 self._update_path_label()
-                 return False
-        else:
-            print("DEBUG: User cancelled bookmarks file selection.")
-            self.bookmarks_file = None
-            self._update_path_label()
-            self.app.show_warning_dialog("Файл закладок не обрано. Збереження та завантаження неможливе.")
-            return False
 
     def build_ui(self):
         self.page_widget = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=10)
@@ -156,14 +104,14 @@ class BookmarksPage:
         self._update_path_label()
         self.page_widget.pack_start(self.path_label, False, False, 0)
 
-        self.populate_listbox()
+        self.populate_listbox() 
         self.page_widget.show_all()
 
         return self.page_widget
 
     def load_bookmarks(self):
         if not self.bookmarks_file:
-            print("DEBUG: load_bookmarks called but path is not set.")
+            print("ERROR: load_bookmarks called but bookmarks_file is not set!")
             self.bookmarks = []
             return
 
@@ -194,14 +142,10 @@ class BookmarksPage:
             self.bookmarks = []
             self.app.show_warning_dialog(f"Неочікувана помилка при завантаженні закладок:\n{e}")
 
-
     def save_bookmarks(self):
-        if not self._ensure_bookmarks_path():
-             return
-
         if not self.bookmarks_file:
-             print("CRITICAL ERROR: save_bookmarks called but self.bookmarks_file is still None after check!")
-             self.app.show_warning_dialog("Критична помилка: Неможливо зберегти закладки (шлях не встановлено).")
+             print("ERROR: Cannot save bookmarks, file path is not set.")
+             self.app.show_warning_dialog("Помилка: Неможливо зберегти закладки (шлях не встановлено).")
              return
 
         print(f"DEBUG: Saving {len(self.bookmarks)} bookmarks to {self.bookmarks_file}")
@@ -217,43 +161,48 @@ class BookmarksPage:
              print(f"Неочікувана помилка при збереженні закладок: {e}")
              self.app.show_warning_dialog(f"Неочікувана помилка при збереженні закладок:\n{e}")
 
+
     def populate_listbox(self):
         print(f"DEBUG: Populating listbox. Have {len(self.bookmarks)} bookmarks.")
         if not hasattr(self, 'listbox') or not self.listbox:
              print("Warning: populate_listbox called before listbox is created.")
              return
+
+        # Очищення старого списку
         for child in self.listbox.get_children():
             self.listbox.remove(child)
 
-        if not self.bookmarks:
+        if not self.bookmarks: # Якщо список порожній або став None через помилку
              print("DEBUG: No bookmarks to display.")
-             # Можна додати мітку "Немає закладок"
-             # placeholder_row = Gtk.ListBoxRow()
-             # placeholder_label = Gtk.Label(label="<i>Немає збережених закладок</i>", use_markup=True, margin=10, halign=Gtk.Align.CENTER)
-             # placeholder_row.add(placeholder_label)
-             # placeholder_row.set_selectable(False)
-             # self.listbox.add(placeholder_row)
+             # Можна додати мітку "Немає закладок" якщо бажано
+             placeholder_row = Gtk.ListBoxRow()
+             placeholder_label = Gtk.Label(label="<i>Немає збережених закладок</i>", use_markup=True, margin=10, halign=Gtk.Align.CENTER)
+             placeholder_row.add(placeholder_label)
+             placeholder_row.set_selectable(False) 
+             self.listbox.add(placeholder_row)
              self.listbox.show_all()
              return
 
         display_list = []
         for i, bm in enumerate(self.bookmarks):
-            if not isinstance(bm, dict):
+            if not isinstance(bm, dict): 
                 print(f"WARNING: Skipping invalid bookmark item at index {i}: {bm}")
                 continue
-            sort_key = bm.get('name', '').lower()
-            display_list.append((sort_key, i, bm))
+            sort_key_name = bm.get('name', '').lower()
+            sort_key_url = bm.get('url', '').lower()
+            display_list.append(((sort_key_name, sort_key_url), i, bm))
 
         try:
-            display_list.sort(key=lambda item: item[0])
+            display_list.sort(key=lambda item: item[0]) 
         except Exception as e:
             print(f"ERROR: Failed to sort bookmarks for display: {e}")
+            display_list = [(None, i, bm) for i, bm in enumerate(self.bookmarks) if isinstance(bm, dict)]
             pass
 
         for sort_key, original_index, bm_data in display_list:
             name = bm_data.get('name', 'Без назви')
             url = bm_data.get('url', 'Немає URL')
-            label_text = f"<b>{name}</b>\n<small>{url}</small>"
+            label_text = f"<b>{GLib.markup_escape_text(name)}</b>\n<small>{GLib.markup_escape_text(url)}</small>"
             try:
                 label = Gtk.Label(xalign=0, wrap=True, ellipsize=Pango.EllipsizeMode.END)
                 label.set_markup(label_text)
@@ -263,79 +212,136 @@ class BookmarksPage:
                 self.listbox.add(row)
             except Exception as e:
                 print(f"ERROR: Failed to create or add row for bookmark (Index: {original_index}, Data: {bm_data}): {e}")
+                try:
+                    fallback_text = f"{name}\n{url}"
+                    label = Gtk.Label(fallback_text, xalign=0, wrap=True, ellipsize=Pango.EllipsizeMode.END)
+                    row = Gtk.ListBoxRow()
+                    row.add(label)
+                    row.bookmark_index = original_index
+                    self.listbox.add(row)
+                except Exception as fallback_e:
+                    print(f"ERROR: Failed to create fallback row: {fallback_e}")
+
 
         self.listbox.show_all()
-        print(f"DEBUG: Listbox population finished. Added {len(self.listbox.get_children())} rows.")
+        print(f"DEBUG: Listbox population finished. Added {len(self.listbox.get_children())} rows (excluding placeholder if used).")
+
 
     def _on_add_clicked(self, widget):
-        if not self._ensure_bookmarks_path():
-            return
-
         url = self.url_entry.get_text().strip()
         name = self.name_entry.get_text().strip()
+
         if not url:
             self.app.show_warning_dialog("URL закладки не може бути порожнім.")
             return
-        if not name: name = url
-        if any(isinstance(b, dict) and b.get('url') == url for b in self.bookmarks):
-             print(f"DEBUG: Bookmark with URL '{url}' already exists.")
-        new_bookmark = {'name': name, 'url': url}
-        print(f"DEBUG: Adding bookmark: {new_bookmark}")
-        self.bookmarks.append(new_bookmark)
-        self.save_bookmarks()
-        self.populate_listbox()
-        if hasattr(self, 'url_entry') and self.url_entry: self.url_entry.set_text("")
-        if hasattr(self, 'name_entry') and self.name_entry: self.name_entry.set_text("")
+
+        if not (url.startswith("http://") or url.startswith("https://") or "youtube.com" in url or "youtu.be" in url):
+             print(f"Warning: Adding bookmark with potentially non-standard URL scheme: {url}")
+
+
+        if not name:
+            try:
+                 hostname = self.url_handler.get_hostname_from_url(url, sanitize=False)
+                 name = hostname if hostname else url # Використовуємо хост або весь URL
+            except Exception:
+                 name = url 
+
+        is_duplicate = False
+        for i, bm in enumerate(self.bookmarks):
+            if isinstance(bm, dict) and bm.get('url') == url:
+                print(f"DEBUG: Bookmark with URL '{url}' already exists at index {i}.")
+                is_duplicate = True
+                self.app.show_info_dialog("Інформація", f"Закладка з URL:\n{url}\nвже існує.")
+                break 
+
+        if not is_duplicate:
+            new_bookmark = {'name': name, 'url': url}
+            print(f"DEBUG: Adding bookmark: {new_bookmark}")
+            self.bookmarks.append(new_bookmark)
+            self.save_bookmarks()
+            self.populate_listbox() 
+
+            if hasattr(self, 'url_entry') and self.url_entry: self.url_entry.set_text("")
+            if hasattr(self, 'name_entry') and self.name_entry: self.name_entry.set_text("")
 
 
     def _on_remove_clicked(self, widget):
-        if not self._ensure_bookmarks_path():
-            return
-
         selected_row = self.listbox.get_selected_row()
-        if selected_row and hasattr(selected_row, 'bookmark_index'):
-            index_to_remove = selected_row.bookmark_index
-            print(f"DEBUG: Attempting to remove bookmark at original index: {index_to_remove}")
-            if 0 <= index_to_remove < len(self.bookmarks):
-                removed_item = self.bookmarks.pop(index_to_remove)
-                print(f"DEBUG: Removed bookmark: {removed_item}")
-                self.save_bookmarks()
-                self.populate_listbox()
-            else:
-                print(f"ERROR: Invalid bookmark index {index_to_remove} for removal. Current bookmark count: {len(self.bookmarks)}")
-                self.app.show_warning_dialog("Помилка: Не вдалося видалити закладку (некоректний індекс).")
-                self.populate_listbox()
-        else:
-             if self.bookmarks_file:
-                self.app.show_warning_dialog("Будь ласка, виберіть закладку для видалення.")
 
-    def _on_bookmark_activated(self, listbox, row):
-        if not self.bookmarks:
-             print("DEBUG: Bookmark activated, but list is empty.")
+        if not selected_row:
+             self.app.show_warning_dialog("Будь ласка, виберіть закладку для видалення.")
              return
 
-        if hasattr(row, 'bookmark_index'):
-            index = row.bookmark_index
-            print(f"DEBUG: Bookmark activated at original index: {index}")
-            if 0 <= index < len(self.bookmarks):
-                bookmark = self.bookmarks[index]
-                if not isinstance(bookmark, dict):
-                    print(f"ERROR: Activated bookmark at index {index} is not a dictionary: {bookmark}")
-                    self.app.show_warning_dialog("Помилка: Обрана закладка має некоректний формат.")
-                    return
+        if not hasattr(selected_row, 'bookmark_index'):
+             print("DEBUG: Tried to remove the placeholder row or an invalid row.")
+             return
 
-                url = bookmark.get('url')
-                print(f"DEBUG: Activating URL: {url}")
-                if url:
-                    page_target = "youtube"
-                    if "youtube.com" in url or "youtu.be" in url: page_target = "youtube"
-                    elif url.startswith("http://") or url.startswith("https://"): page_target = "httrack"
-                    else: print(f"DEBUG: Unknown URL type for activation: {url}. Defaulting to YouTube page.")
+        index_to_remove = selected_row.bookmark_index
+        print(f"DEBUG: Attempting to remove bookmark at original index: {index_to_remove}")
+
+        if 0 <= index_to_remove < len(self.bookmarks):
+            removed_item = self.bookmarks.pop(index_to_remove)
+            print(f"DEBUG: Removed bookmark: {removed_item}")
+            self.save_bookmarks() # Зберігаємо зміни
+            self.populate_listbox() # Оновлюємо UI
+        else:
+            print(f"ERROR: Invalid bookmark index {index_to_remove} for removal. Current bookmark count: {len(self.bookmarks)}")
+            self.app.show_warning_dialog("Помилка: Не вдалося видалити закладку (некоректний індекс). Спробуйте оновити список.")
+            self.populate_listbox()
+
+
+    def _on_bookmark_activated(self, listbox, row):
+        if not hasattr(row, 'bookmark_index'):
+             print("DEBUG: Activated the placeholder row or an invalid row.")
+             return
+
+        index = row.bookmark_index
+        print(f"DEBUG: Bookmark activated at original index: {index}")
+
+        # Валідація індексу та типу даних
+        if 0 <= index < len(self.bookmarks) and isinstance(self.bookmarks[index], dict):
+            bookmark = self.bookmarks[index]
+            url = bookmark.get('url')
+            print(f"DEBUG: Activating URL: {url}")
+
+            if url:
+                page_target = None
+                try:
+                    lower_url = url.lower()
+                    if "youtube.com" in lower_url or "youtu.be" in lower_url:
+                        page_target = "youtube"
+                    elif lower_url.startswith("http://") or lower_url.startswith("https://") or lower_url.startswith("ftp://"):
+                         is_youtube = False
+                         try:
+                              parsed = self.url_handler.urlparse(url)
+                              if parsed.hostname and ('youtube.com' in parsed.hostname or 'youtu.be' in parsed.hostname):
+                                   is_youtube = True
+                         except Exception: pass 
+                         if not is_youtube:
+                              page_target = "httrack"
+
+                    if not page_target and (lower_url.startswith("http://") or lower_url.startswith("https://")):
+                        page_target = "httrack"
+                        print(f"DEBUG: URL '{url}' doesn't look like YouTube, trying HTTrack page.")
+                    elif not page_target:
+                         print(f"DEBUG: Unknown URL type for activation: {url}. Cannot determine target page.")
+                         self.app.show_warning_dialog(f"Не вдалося визначити тип посилання для URL:\n{url}\n\nВідкрийте його вручну на відповідній вкладці.")
+
+                except Exception as e:
+                     print(f"ERROR determining page target for url '{url}': {e}")
+                     self.app.show_warning_dialog(f"Помилка визначення типу посилання:\n{e}")
+
+                if page_target:
                     self.app.go_to_page_with_url(page_target, url)
-                else: self.app.show_warning_dialog("У цій закладці немає URL.")
+
             else:
-                print(f"ERROR: Invalid bookmark index {index} upon activation. Current bookmark count: {len(self.bookmarks)}")
-                self.app.show_warning_dialog("Помилка: Не вдалося активувати закладку (некоректний індекс).")
+                self.app.show_warning_dialog("У цій закладці немає URL.")
+        else:
+            print(f"ERROR: Invalid bookmark index ({index}) or data type upon activation. Current bookmark count: {len(self.bookmarks)}")
+            self.app.show_warning_dialog("Помилка: Не вдалося активувати закладку (некоректний індекс або формат даних).")
+            self.populate_listbox()
+
 
     def get_page_widget(self):
          return self.page_widget
+

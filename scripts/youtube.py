@@ -1,236 +1,316 @@
+# scripts/youtube.py
+
 import yt_dlp
 import os
-import sys
-import time
 import re
-import pprint
-from gi.repository import GLib
+import time
+import traceback
+from typing import Optional, Callable, Dict, Any, List, Union
 
-_last_downloaded_file_path = None
-_spinner = ['|', '/', '-', '\\']
-_spinner_index = 0
+# Функція для очищення ANSI кодів та пробілів
+def clean_string(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    # Видалення ANSI escape кодів кольору
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    cleaned = ansi_escape.sub('', s)
+    # Заміна множинних пробілів на один та видалення пробілів на початку/кінці
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
 
-def log_message(message, level="INFO"):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    sys.stderr.write(f"{timestamp} YT-DLP LOG ({level}): {message}\n")
-    sys.stderr.flush()
-
-def progress_hook(d, progress_callback, status_callback):
-    global _spinner_index
-    if d['status'] == 'downloading':
-        total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
-        downloaded_bytes = d.get('downloaded_bytes', 0)
-        fraction = 0.0
-        if total_bytes and total_bytes > 0: fraction = min(1.0, max(0.0, downloaded_bytes / total_bytes))
-        if progress_callback: GLib.idle_add(progress_callback, fraction)
-        filename = d.get('filename', 'файл')
-        short_filename = os.path.basename(filename)
-        short_filename = re.sub(r'\.f\d+$', '', short_filename)
-        if short_filename.endswith('.part'): short_filename = short_filename[:-5]
-        speed_str = d.get('_speed_str', '...').strip()
-        eta_str = d.get('_eta_str', '...').strip()
-        percent_str = d.get('_percent_str', f'{int(fraction*100)}%').strip()
-        status_msg = f"Завантаження ({percent_str}): {short_filename} [{speed_str} ETA {eta_str}]"
-        if status_callback:
-             spinner_char = _spinner[_spinner_index % len(_spinner)]
-             _spinner_index += 1
-             GLib.idle_add(status_callback, f"{spinner_char} {status_msg}")
-    elif d['status'] == 'error':
-        error_message = d.get('error', 'Невідома помилка yt-dlp')
-        log_message(f"Error in hook: {error_message}", level="ERROR")
-    elif d['status'] == 'finished':
-        filename = d.get('filename')
-        if filename:
-             if not filename.endswith(('.part', '.ytdl', '.temp')):
-                 log_message(f"Finished downloading final/merged file: {filename}")
-                 _last_downloaded_file_path = filename
-             else:
-                 log_message(f"Finished downloading fragment/temporary file: {filename}")
-             if status_callback: GLib.idle_add(status_callback, f"Завершено етап: {os.path.basename(filename)}")
-        else:
-             log_message("Download part finished, filename not in hook dict.", level="WARNING")
-    elif '_type' in d and d['_type'] == 'post_process':
-         postprocessor_name = d.get('postprocessor')
-         stage = d.get('status', 'running')
-         status_msg = f"Пост-обробка ({postprocessor_name}): {stage}"
-         if stage == 'started' or stage == 'running':
-              if progress_callback: GLib.idle_add(progress_callback, 0.95)
-         log_message(f"Postprocessor {postprocessor_name}: {stage}")
-         if status_callback: GLib.idle_add(status_callback, status_msg)
-
-def download_youtube_video_with_progress(
-    video_url, output_dir,
-    format_selection="best", # 'best', 'best_mp4', 'audio_best', 'audio_mp3', 'audio_m4a'
-    audio_format_override=None, # 'mp3', 'aac', 'm4a', 'opus', 'vorbis', 'wav' (used if format_selection includes 'audio')
-    download_subs=False,
-    sub_langs="uk,en", # Default languages
-    embed_subs=False,
-    progress_callback=None, status_callback=None
-):
-    global _last_downloaded_file_path
-    _last_downloaded_file_path = None
-
-    log_message(f"Attempting download: URL={video_url}, Dir={output_dir}, FormatSel={format_selection}, AudioFmt={audio_format_override}, Subs={download_subs}, Langs={sub_langs}, Embed={embed_subs}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    hook = lambda d: progress_hook(d, progress_callback, status_callback)
-
-    cookies_file_path = os.path.join(os.path.expanduser("~"), "youtube_cookies.txt")
-    cookies_found = os.path.exists(cookies_file_path)
-    if cookies_found: log_message(f"Using cookies file: {cookies_file_path}")
-    else: log_message(f"Cookies file not found at: {cookies_file_path}")
-
-    ydl_opts = {
-        'outtmpl': f'{output_dir}/%(title)s [%(id)s].%(ext)s',
-        'retries': 5, 'fragment_retries': 5, 'ignoreerrors': False,
-        'progress_hooks': [hook], 'quiet': True, 'logtostderr': True, 'verbose': False, 'no_warnings': False,
-        'sleep_interval': 2, 'max_sleep_interval': 5,
-        'useragent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36',
-        'merge_output_format': 'mkv', # Default merge format
-        'postprocessors': [], # Start with empty postprocessors
+# Helper to create default YDL options (avoid repetition)
+def _get_default_ydl_opts() -> Dict[str, Any]:
+    return {
+        'nocheckcertificate': True,
+        'ignoreerrors': True, # Continue processing playlist items on error
+        'quiet': True,        # Suppress yt-dlp's direct stdout/stderr output
+        'verbose': False,
+        'no_warnings': True,
+        'continuedl': True,   # Enables resuming (report_resuming_byte)
+        # 'restrictfilenames': True, # Optional: Limit characters in filenames
     }
 
-    # -- Format Selection Logic --
-    is_audio_only = format_selection.startswith('audio_')
+# NEW FUNCTION: Extract information without downloading
+def extract_youtube_info(
+    url: str,
+    extra_opts: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Отримує метадані про відео або плейлист за вказаною URL-адресою, не завантажуючи файл.
+    Corresponds to the concept of yt-dlp's extract_info(url, download=False).
 
-    if format_selection == 'best':
-        ydl_opts['format'] = 'bestvideo+bestaudio/best'
-    elif format_selection == 'best_mp4':
-        # Try best MP4 video + best AAC audio, fallback to best MP4 overall
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]/best[ext=mp4]'
-        # Ensure final container is mp4 if we merged something else
-        ydl_opts['postprocessors'].append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
-    elif is_audio_only:
-        # Select best audio initially, post-processing will handle format
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['extract_audio'] = True # Tell yt-dlp to extract audio
+    Args:
+        url: URL відео або плейлиста YouTube.
+        extra_opts: Додаткові параметри для yt-dlp.
 
-        # Determine final audio format
-        target_audio_format = None
-        if format_selection == 'audio_mp3':
-            target_audio_format = 'mp3'
-        elif format_selection == 'audio_m4a':
-            target_audio_format = 'm4a' # Usually means AAC
-        # Allow override if provided
-        if audio_format_override in ['mp3', 'aac', 'm4a', 'opus', 'vorbis', 'wav']:
-             target_audio_format = audio_format_override
-        elif not target_audio_format: # Default to best if no specific format requested
-             target_audio_format = 'best' # Let yt-dlp decide based on 'bestaudio'
+    Returns:
+        Словник з інформацією про відео/плейлист або None у разі помилки.
+    """
+    ydl_opts = _get_default_ydl_opts()
+    # We specifically want info extraction, not download
+    ydl_opts['extract_flat'] = 'in_playlist' # Get basic info for playlist entries quickly
+    ydl_opts['skip_download'] = True
 
-        if target_audio_format != 'best':
-            ydl_opts['postprocessors'].append({
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': target_audio_format,
-                'preferredquality': '192', # Default quality for conversion (e.g., 192k for mp3)
-            })
-    else: # Fallback to best if unknown format_selection
-        log_message(f"Unknown format selection '{format_selection}', falling back to 'best'", level="WARNING")
-        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+    if extra_opts:
+        ydl_opts.update(extra_opts)
 
-    # -- Subtitle Logic --
-    if download_subs:
-        ydl_opts['writesubtitles'] = True
-        ydl_opts['writeautomaticsub'] = True # Include auto-generated subs
-        if sub_langs:
-            ydl_opts['subtitleslangs'] = sub_langs.split(',') # Expect comma-separated list
-        if embed_subs:
-            ydl_opts['embedsubtitles'] = True
-            # Embedding usually works best with MKV
-            if not ydl_opts.get('merge_output_format'):
-                 ydl_opts['merge_output_format'] = 'mkv'
-
-    # -- Cookies Logic --
-    if cookies_found:
-        ydl_opts['cookiefile'] = cookies_file_path
-        ydl_opts['extractor-args'] = 'youtube:player_client=default,-web_creator'
-        log_message("Applying cookies and extractor-args workaround.")
-
-    # Remove empty postprocessors list if nothing was added
-    if not ydl_opts['postprocessors']:
-        del ydl_opts['postprocessors']
-
-    if status_callback: GLib.idle_add(status_callback, f"Підготовка до завантаження: {video_url}...")
-
-    final_path = None
-    info_dict = None
+    print(f"Вилучення інформації для: {url}")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            log_message(f"Starting yt-dlp process for: {video_url} with options: { {k: v for k, v in ydl_opts.items() if k != 'progress_hooks'} }")
-            info_dict = ydl.extract_info(video_url, download=True)
-            log_message("yt-dlp extract_info with download=True finished.")
+            # Use extract_info directly with download=False implied by skip_download
+            info_dict = ydl.extract_info(url, download=False)
+            return info_dict
+    except yt_dlp.utils.DownloadError as e:
+        error_message = clean_string(str(e))
+        match = re.search(r'ERROR: (.*?)(?:;|$)', error_message, re.IGNORECASE)
+        if match: error_message = match.group(1).strip()
+        print(f"Помилка вилучення інформації yt-dlp: {error_message}")
+        return None
+    except Exception as e:
+        print(f"Неочікувана помилка під час вилучення інформації: {e}")
+        traceback.print_exc()
+        return None
 
-            if info_dict:
-                log_message(f"Info dict received. Keys: {list(info_dict.keys())}")
-                log_msg_info = {'id': info_dict.get('id'), 'title': info_dict.get('title'), 'filepath': info_dict.get('filepath'), '_filename': info_dict.get('_filename'), 'filename': info_dict.get('filename'), 'requested_downloads': info_dict.get('requested_downloads'), 'ext': info_dict.get('ext'), 'format': info_dict.get('format')}
-                log_message(f"Relevant info dict fields:\n{pprint.pformat(log_msg_info)}")
 
-                if info_dict.get('filepath') and os.path.exists(info_dict['filepath']):
-                    final_path = info_dict['filepath']
-                    log_message(f"Priority 1: Final path from info_dict['filepath']: {final_path}")
-                if not final_path and info_dict.get('_filename') and os.path.exists(info_dict['_filename']):
-                     final_path = info_dict['_filename']
-                     log_message(f"Priority 2: Final path from info_dict['_filename']: {final_path}")
-                if not final_path and info_dict.get('filename') and os.path.exists(info_dict['filename']):
-                     final_path = info_dict['filename']
-                     log_message(f"Priority 3: Final path from info_dict['filename']: {final_path}")
-                if not final_path:
-                     log_message(f"Checking last path from 'finished' hook: {_last_downloaded_file_path}")
-                     if _last_downloaded_file_path and os.path.exists(_last_downloaded_file_path) and not _last_downloaded_file_path.endswith(('.part', '.ytdl', '.temp')):
-                           final_path = _last_downloaded_file_path
-                           log_message(f"Priority 4: Using non-temporary path from 'finished' hook: {final_path}")
-                     elif _last_downloaded_file_path:
-                         log_message(f"Path from hook '{_last_downloaded_file_path}' does not exist or is temporary.", level="WARNING")
-                if not final_path:
-                    log_message("Attempting prepare_filename...")
-                    try:
-                         prepared_path = ydl.prepare_filename(info_dict)
-                         log_message(f"prepare_filename result: {prepared_path}")
-                         if os.path.exists(prepared_path):
-                              final_path = prepared_path
-                              log_message(f"Priority 5: Final path confirmed using prepare_filename: {final_path}")
-                         else: log_message(f"Path from prepare_filename does not exist: {prepared_path}", level="WARNING")
-                    except Exception as e: log_message(f"Error using prepare_filename: {e}", level="ERROR")
-                if not final_path:
-                     log_message("Final path still not determined. Searching directory by ID...", level="WARNING")
-                     video_id = info_dict.get('id')
-                     found_file = None
-                     if video_id:
-                          try:
-                              log_message(f"Searching for files containing '{video_id}' in '{output_dir}'")
-                              dir_list = os.listdir(output_dir)
-                              log_message(f"Directory contents: {dir_list}")
-                              for f in dir_list:
-                                  if video_id in f and not f.endswith(('.part', '.ytdl', '.temp', '.mkv.frag', '.mp4.frag')):
-                                       potential_path = os.path.join(output_dir, f)
-                                       if os.path.isfile(potential_path):
-                                            found_file = potential_path
-                                            log_message(f"Priority 6: Found potential file by searching ID: {found_file}")
-                                            break
-                                       else: found_file = None
-                          except Exception as search_e: log_message(f"Error searching directory for file: {search_e}", level="ERROR")
-                     if found_file: final_path = found_file
-                     else: log_message("Could not find file by searching ID.", level="ERROR")
+# MODIFIED FUNCTION: Renamed and accepts list/single URL
+def download_youtube_media(
+    urls: Union[str, List[str]], # Changed to accept list or single string
+    output_dir: str,
+    format_selection: str = "best",
+    audio_format_override: Optional[str] = None,
+    download_subs: bool = False,
+    sub_langs: Optional[str] = None,
+    embed_subs: bool = False,
+    status_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[float], None]] = None
+):
+    """
+    Завантажує відео/аудіо або плейлисти з YouTube з наданого URL або списку URL.
+    Corresponds to the high-level concept of yt-dlp's download(url_list).
+    Reporting is handled via callbacks based on internal yt-dlp reports.
 
-            if not final_path:
-                 log_message("FATAL: Could not determine final path by any method.", level="CRITICAL")
-                 last_hook_path = _last_downloaded_file_path or "None"
-                 info_keys = list(info_dict.keys()) if info_dict else "None"
-                 raise RuntimeError(f"Не вдалося отримати шлях до завантаженого файлу після завершення yt-dlp. Last hook path: {last_hook_path}. Info dict keys: {info_keys}")
-            if not os.path.exists(final_path):
-                  log_message(f"FATAL: Determined path '{final_path}' does not exist!", level="CRITICAL")
-                  raise RuntimeError(f"Визначений шлях '{final_path}' не вказує на існуючий файл після завантаження.")
+    Args:
+        urls: Один URL або список URL відео/плейлистів YouTube.
+        output_dir: Базова директорія для збереження файлів.
+        format_selection: Вибір формату ('best', 'best_mp4', 'original', 'audio_best', 'audio_mp3', 'audio_m4a').
+        audio_format_override: Перевизначення аудіо кодека для аудіо форматів.
+        download_subs: Чи завантажувати субтитри.
+        sub_langs: Бажані мови субтитрів (рядок через кому).
+        embed_subs: Чи вбудовувати субтитри у відеофайл.
+        status_callback: Функція для оновлення статусу (отримує звіти типу report_*).
+        progress_callback: Функція для оновлення прогресу (отримує звіти типу report_download_progress).
+    """
 
-        log_message(f"Download process complete. Returning path: {final_path}")
-        if progress_callback: GLib.idle_add(progress_callback, 1.0)
-        if status_callback: GLib.idle_add(status_callback, f"Завантаження завершено: {os.path.basename(final_path)}")
-        return final_path
+    def _safe_callback(callback: Optional[Callable], *args: Any, **kwargs: Any):
+        if callback and callable(callback):
+            try:
+                callback(*args, **kwargs)
+            except Exception as e:
+                print(f"Помилка під час виклику callback {callback.__name__}: {e}")
+
+    _start_time = time.time()
+    _last_reported_progress = -1.0
+
+    # progress_hook remains the central place for reporting
+    def progress_hook(d: Dict[str, Any]):
+        nonlocal _start_time, _last_reported_progress
+        status = d.get('status')
+        progress_fraction = -1.0
+
+        # --- Downloading status --- (Handles report_download_progress)
+        if status == 'downloading':
+            total_bytes_estimate = d.get('total_bytes_estimate')
+            total_bytes = d.get('total_bytes')
+            downloaded_bytes = d.get('downloaded_bytes')
+            speed_str = clean_string(d.get('_speed_str', 'N/A'))
+            eta_str = clean_string(d.get('_eta_str', 'N/A'))
+            percent_str = clean_string(d.get('_percent_str', '0.0%')).replace('%', '')
+
+            try:
+                progress_fraction = float(percent_str) / 100.0
+            except ValueError:
+                 # Fallback calculation if percentage string is invalid
+                 if total_bytes and downloaded_bytes is not None and total_bytes > 0:
+                      progress_fraction = max(0.0, min(1.0, downloaded_bytes / total_bytes))
+                 elif total_bytes_estimate and downloaded_bytes is not None and total_bytes_estimate > 0:
+                     progress_fraction = max(0.0, min(1.0, downloaded_bytes / total_bytes_estimate))
+
+            if progress_fraction >= 0 and abs(progress_fraction - _last_reported_progress) > 0.001:
+                 _safe_callback(progress_callback, progress_fraction)
+                 _last_reported_progress = progress_fraction
+
+            info = d.get('info_dict') # Info from internal extract_info
+            display_filename = info.get('title', None) if info else None
+            if not display_filename:
+                # filename from internal prepare_filename logic
+                display_filename = os.path.basename(d.get('filename', 'Невідомий файл'))
+
+            # Report overall progress (Corresponds to report_progress)
+            status_msg = f"Завантаження '{display_filename}': {percent_str}% ({speed_str}, ETA: {eta_str})"
+            _safe_callback(status_callback, status_msg)
+            # Note: Resuming reports (report_resuming_byte etc.) handled internally by yt-dlp
+
+        # --- Error status --- (Corresponds to report_retry failure)
+        elif status == 'error':
+            filename = os.path.basename(d.get('filename', 'Невідомий файл'))
+            error_msg = f"Помилка завантаження '{filename}'" # Simplified message
+            _safe_callback(status_callback, error_msg)
+            _last_reported_progress = 0.0
+            _safe_callback(progress_callback, 0.0)
+            # Full error is caught in the main try/except block
+
+        # --- Finished status --- (Handles report_destination, report_file_already_downloaded)
+        elif status == 'finished':
+            info = d.get('info_dict')
+            display_filename = info.get('title', None) if info else None
+            final_filename = d.get('filename', 'Невідомий файл') # The actual destination
+            if not display_filename:
+                display_filename = os.path.basename(final_filename)
+
+            elapsed = d.get('elapsed', time.time() - _start_time)
+            total_bytes = d.get('total_bytes') or d.get('downloaded_bytes')
+            size_str = f"{total_bytes / (1024 * 1024):.2f} MB" if total_bytes else "N/A"
+
+            # Report completion and destination file name
+            finish_msg = f"Завершено '{display_filename}' ({size_str}) за {elapsed:.2f} сек."
+            _safe_callback(status_callback, finish_msg)
+
+            if _last_reported_progress < 1.0:
+                _safe_callback(progress_callback, 1.0)
+            _last_reported_progress = 1.0
+            _start_time = time.time() # Reset timer for next file in list/playlist
+
+        # --- Postprocessing status --- (Part of internal process_info)
+        elif d.get('_type') == 'postprocessor' and status == 'started':
+             processor = d.get('postprocessor')
+             info = d.get('info_dict')
+             display_filename = info.get('title', 'файл') if info else 'файл'
+             status_msg = f"Обробка '{display_filename}' ({processor})..."
+             _safe_callback(status_callback, status_msg)
+             current_progress = max(1.0, _last_reported_progress) if _last_reported_progress >= 0 else 1.0
+             _safe_callback(progress_callback, current_progress)
+             _last_reported_progress = 1.0
+
+
+    # ---- Setup yt-dlp options ----
+    ydl_opts = _get_default_ydl_opts() # Start with defaults
+    ydl_opts['progress_hooks'] = [progress_hook]
+    # Filename template (Drives internal prepare_filename)
+    ydl_opts['outtmpl'] = os.path.join(output_dir, '%(uploader)s', '%(title)s.%(ext)s')
+
+    # --- Format Selection ---
+    is_audio_only = format_selection.startswith('audio_')
+    format_code = ''
+    pp_opts: List[Dict[str, Any]] = []
+    # Clear potentially conflicting old options
+    if 'merge_output_format' in ydl_opts: del ydl_opts['merge_output_format']
+    if 'extract_audio' in ydl_opts: del ydl_opts['extract_audio']
+    if 'postprocessors' in ydl_opts: del ydl_opts['postprocessors']
+    if 'audioformat' in ydl_opts: del ydl_opts['audioformat']
+
+    if format_selection == 'best':
+        format_code = 'bestvideo+bestaudio/best'
+    elif format_selection == 'best_mp4':
+        format_code = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        ydl_opts['merge_output_format'] = 'mp4'
+    elif format_selection == 'original':
+        format_code = 'best[vcodec!=none][acodec!=none]/best'
+    elif is_audio_only:
+        format_code = 'bestaudio/best'
+        target_audio_codec = None
+        if format_selection == 'audio_mp3': target_audio_codec = 'mp3'
+        elif format_selection == 'audio_m4a': target_audio_codec = 'aac'
+        if audio_format_override and audio_format_override != 'best':
+            target_audio_codec = audio_format_override
+
+        if target_audio_codec and target_audio_codec != 'best':
+            pp_opts.append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': target_audio_codec,
+                'preferredquality': '192',
+            })
+            ydl_opts['audioformat'] = target_audio_codec # Inform yt-dlp about the target
+            ydl_opts['extract_audio'] = True # Ensure extraction happens
+
+    ydl_opts['format'] = format_code
+    if pp_opts:
+        ydl_opts['postprocessors'] = pp_opts
+
+    # --- Subtitle Handling ---
+    # ... (subtitle logic remains the same) ...
+    sub_langs_list = []
+    ydl_opts['writesubtitles'] = False
+    ydl_opts['writeautomaticsub'] = False
+    ydl_opts['embedsubtitles'] = False
+    if 'subtitleslangs' in ydl_opts: del ydl_opts['subtitleslangs']
+
+    if download_subs:
+        ydl_opts['writesubtitles'] = True
+        ydl_opts['writeautomaticsub'] = True
+        if sub_langs:
+            sub_langs_list = [lang.strip() for lang in sub_langs.split(',') if lang.strip()]
+        if not sub_langs_list:
+             sub_langs_list = ['uk', 'en']
+        ydl_opts['subtitleslangs'] = sub_langs_list
+
+        if embed_subs and not is_audio_only:
+            ydl_opts['embedsubtitles'] = True
+            # Prefer MKV for embedding if not explicitly MP4
+            # if ydl_opts.get('merge_output_format') != 'mp4':
+            #    ydl_opts['merge_output_format'] = 'mkv' # Auto handled usually
+
+    # --- Execute Download ---
+    url_list = []
+    if isinstance(urls, str):
+        url_list = [urls]
+        _safe_callback(status_callback, f"Запуск завантаження для: {urls}")
+    elif isinstance(urls, list):
+        url_list = urls
+        _safe_callback(status_callback, f"Запуск завантаження для {len(urls)} URL...")
+    else:
+        _safe_callback(status_callback, "Помилка: Неправильний тип URL (очікується рядок або список).")
+        _safe_callback(progress_callback, 0.0)
+        return # Stop if URLs are invalid type
+
+    if not url_list:
+        _safe_callback(status_callback, "Помилка: Список URL порожній.")
+        _safe_callback(progress_callback, 0.0)
+        return
+
+    _safe_callback(progress_callback, 0.0)
+    _last_reported_progress = 0.0
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Pass the list of URLs to the download method
+            ydl.download(url_list)
+
+        _safe_callback(status_callback, "Усі завдання в черзі завершено.")
+        if _last_reported_progress < 1.0:
+             _safe_callback(progress_callback, 1.0)
 
     except yt_dlp.utils.DownloadError as e:
-        log_message(f"yt-dlp DownloadError: {e}", level="ERROR")
-        error_details = str(e)
-        if error_details.startswith("ERROR: "): error_details = error_details[len("ERROR: "):]
-        raise RuntimeError(f"Помилка завантаження YouTube ({video_url}): {error_details}")
+        # Handle final download errors (after retries etc.)
+        error_message = clean_string(str(e))
+        match = re.search(r'ERROR: (.*?)(?:;|$)', error_message, re.IGNORECASE)
+        if match: error_message = match.group(1).strip()
+
+        error_msg_log = f"Помилка завантаження yt-dlp: {error_message}"
+        print(error_msg_log)
+        _safe_callback(status_callback, error_msg_log)
+        if _last_reported_progress >= 0:
+            _safe_callback(progress_callback, _last_reported_progress)
+        else:
+            _safe_callback(progress_callback, 0.0)
     except Exception as e:
-        import traceback
-        log_message(f"Unexpected error during yt-dlp operation: {traceback.format_exc()}", level="CRITICAL")
-        raise RuntimeError(f"Неочікувана помилка yt-dlp: {e}")
+        # Handle other unexpected errors
+        error_message = f"Неочікувана помилка під час завантаження: {e}"
+        print(error_message)
+        traceback.print_exc()
+        _safe_callback(status_callback, error_message)
+        if _last_reported_progress >= 0:
+            _safe_callback(progress_callback, _last_reported_progress)
+        else:
+            _safe_callback(progress_callback, 0.0)
+
+
