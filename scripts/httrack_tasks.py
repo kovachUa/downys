@@ -2,67 +2,109 @@
 import subprocess
 import os
 import shutil
-import sys
+import sys # Додано для можливого використання sys.platform
 from gi.repository import GLib
 import time
 from urllib.parse import urlparse
 import re
 
 
-def run_httrack_web_threaded(url, output_dir, status_callback):
+def run_httrack_web_threaded(url, output_dir, status_callback, **kwargs): # Додано **kwargs для гнучкості
     if not url or not output_dir:
         if status_callback: GLib.idle_add(status_callback, "Помилка: Не вказано URL або директорію для HTTrack.")
         raise ValueError("Не вказано URL або директорію для HTTrack.")
 
+    # Перевірка батьківської директорії (залишено як у вашому оригіналі, main.py вже має логіку створення output_dir)
     parent_dir = os.path.dirname(output_dir)
     if parent_dir and parent_dir != '.' and not os.path.isdir(parent_dir):
         if status_callback: GLib.idle_add(status_callback, f"Помилка: Батьківська директорія не існує: {parent_dir}")
         raise FileNotFoundError(f"Батьківська директорія не існує: {parent_dir}")
 
-
     command = ['httrack', url, '-O', output_dir, '--clean']
-    if status_callback: GLib.idle_add(status_callback, f"Запуск HTTrack для {url}...")
+    if status_callback: GLib.idle_add(status_callback, f"Запуск HTTrack для {url} у {output_dir}...")
 
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, startupinfo=None)
+        # Для Windows можна налаштувати startupinfo, щоб приховати консольне вікно httrack
+        si = None
+        if sys.platform == "win32":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE # Приховує вікно
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                   text=True, bufsize=1, startupinfo=si)
 
         while True:
-            line = None
-            line = process.stderr.readline()
-            if not line:
-                 line = process.stdout.readline()
+            if process.poll() is not None: # Перевірка, чи процес завершився
+                break
 
-            if not line:
-                 if process.poll() is not None:
-                     break
-                 time.sleep(0.01)
-                 continue
+            # Намагаємося читати з stdout (більш імовірно для прогресу)
+            line_read_stdout = process.stdout.readline()
+            if line_read_stdout:
+                line_read_stdout = line_read_stdout.strip()
+                if line_read_stdout and status_callback: # Якщо рядок не порожній після strip
+                    GLib.idle_add(status_callback, f"HTTrack: {line_read_stdout[:150]}...")
+                # Якщо рядок прочитано, продовжуємо наступну ітерацію, щоб пріоритезувати подальший stdout та перевірити poll
+                continue
 
-            line = line.strip()
-            if line:
-                 if status_callback: GLib.idle_add(status_callback, f"HTTrack: {line[:150]}...")
+            # Якщо stdout нічого не повернув (або EOF), намагаємося читати з stderr
+            line_read_stderr = process.stderr.readline()
+            if line_read_stderr:
+                line_read_stderr = line_read_stderr.strip()
+                if line_read_stderr and status_callback: # Якщо рядок не порожній після strip
+                    GLib.idle_add(status_callback, f"HTTrack (err): {line_read_stderr[:150]}...")
+                # Якщо рядок прочитано, продовжуємо наступну ітерацію
+                continue
 
-        stdout_remainder = process.stdout.read()
+            # Якщо обидва readline() повернули порожній рядок (EOF для цього потоку)
+            # і процес все ще виконується, коротко засинаємо.
+            if process.poll() is None: # Перевіряємо poll ще раз перед сном
+                time.sleep(0.05) # Невелика пауза, якщо немає виводу, а процес живий
+
+        # Процес завершився, чекаємо на нього та отримуємо залишковий вивід
+        return_code = process.wait() # Гарантує, що процес завершено та ресурси звільнено
+
+        stdout_remainder = process.stdout.read() # Читаємо будь-які залишкові дані
         stderr_remainder = process.stderr.read()
 
-        return_code = process.wait()
+        # Обробка будь-якого залишкового виводу (в основному для налагодження)
+        if stdout_remainder.strip() and status_callback:
+            for rem_line in stdout_remainder.strip().splitlines():
+                 if rem_line.strip(): GLib.idle_add(status_callback, f"HTTrack (rem_out): {rem_line.strip()[:150]}...")
+        if stderr_remainder.strip() and status_callback:
+            for rem_line in stderr_remainder.strip().splitlines():
+                 if rem_line.strip(): GLib.idle_add(status_callback, f"HTTrack (rem_err): {rem_line.strip()[:150]}...")
+
 
         if return_code != 0:
-            error_message = f"HTTrack завершився з помилкою (код {return_code}).\n"
-            if stderr_remainder:
-                 error_message += f"Stderr (остання частина):\n{stderr_remainder[-1000:]}"
-            elif stdout_remainder:
-                 error_message += f"Stdout (остання частина):\n{stdout_remainder[-1000:]}"
-            raise subprocess.CalledProcessError(return_code, command, stdout=stdout_remainder, stderr=stderr_remainder)
+            error_message_parts = [f"HTTrack завершився з помилкою (код {return_code})."]
+            # Використовуємо повністю прочитані stderr_remainder та stdout_remainder
+            if stderr_remainder.strip(): # Пріоритет stderr для повідомлень про помилки
+                 error_message_parts.append(f"Повідомлення з stderr (останні 1000 символів):\n{stderr_remainder.strip()[-1000:]}")
+            elif stdout_remainder.strip():
+                 error_message_parts.append(f"Повідомлення з stdout (останні 1000 символів):\n{stdout_remainder.strip()[-1000:]}")
+            
+            full_error_message = "\n".join(error_message_parts)
+            # Конструктор CalledProcessError приймає stdout та stderr як аргументи
+            raise subprocess.CalledProcessError(return_code, command, output=stdout_remainder, stderr=stderr_remainder)
 
-        if status_callback: GLib.idle_add(status_callback, f"HTTrack завершено. Сайт збережено в {output_dir}.")
+        if status_callback: GLib.idle_add(status_callback, f"HTTrack успішно завершено. Сайт збережено в {output_dir}.")
 
-    except FileNotFoundError:
+    except FileNotFoundError: # Якщо команда 'httrack' не знайдена
+        if status_callback: GLib.idle_add(status_callback, "Помилка: Команда 'httrack' не знайдена.")
         raise RuntimeError("Помилка: Команда 'httrack' не знайдена. Переконайтеся, що HTTrack встановлено і доступний у PATH.")
     except subprocess.CalledProcessError as e:
-        error_output = e.stderr or e.stdout
-        raise RuntimeError(f"Помилка виконання HTTrack: {e.returncode}\n{error_output[-1000:]}")
-    except Exception as e:
+        # Створюємо більш інформативне повідомлення з помилки
+        error_output_msg = "Немає додаткового виводу."
+        # e.stderr та e.stdout будуть заповнені, оскільки ми їх передали при створенні винятку
+        if e.stderr and e.stderr.strip():
+            error_output_msg = f"Stderr: {e.stderr.strip()[-1000:]}"
+        elif e.stdout and e.stdout.strip(): 
+            error_output_msg = f"Stdout: {e.stdout.strip()[-1000:]}"
+        if status_callback: GLib.idle_add(status_callback, f"Помилка виконання HTTrack: {e.returncode}")
+        raise RuntimeError(f"Помилка виконання HTTrack (код {e.returncode}):\n{error_output_msg}")
+    except Exception as e: # Інші неочікувані помилки
+        if status_callback: GLib.idle_add(status_callback, f"Неочікувана помилка HTTrack: {e}")
         raise RuntimeError(f"Неочікувана помилка при запуску HTTrack: {e}")
 
 
@@ -92,75 +134,82 @@ def archive_directory_threaded(directory_to_archive, archive_path, status_callba
         raise ValueError(f"Непідтримуваний формат архіву: {ext}")
 
     directory_to_include_in_archive = directory_to_archive
-    target_directory_in_base_dir = None
+    # target_directory_in_base_dir = None # Змінна не використовується, можна видалити
 
+    # Логіка визначення піддиректорії сайту для архівування
+    # Якщо HTTrack зберігає сайт у піддиректорію всередині output_dir
     if site_subdir_name or site_url:
-         subdir_name = site_subdir_name
-         if not subdir_name and site_url:
+         actual_subdir_name = site_subdir_name
+         if not actual_subdir_name and site_url: # Якщо є URL, спробувати отримати ім'я піддиректорії з нього
               try:
                  parsed_url = urlparse(site_url)
                  hostname = parsed_url.hostname
                  if hostname:
+                      # HTTrack часто використовує ім'я хоста як назву проекту/піддиректорії
+                      # Видаляємо 'www.' та санітизуємо
                       if hostname.startswith("www."):
                            hostname = hostname[4:]
-                      subdir_name = re.sub(r'[^\w.-]', '_', hostname)
-              except Exception as e:
-                 pass
+                      # Проста санітизація, HTTrack може мати складнішу логіку
+                      actual_subdir_name = re.sub(r'[^\w.-]', '_', hostname).strip('_') 
+                      # HTTrack також може включати шлях у назву, це складніше передбачити
+                      # Наприклад, example.com/path -> example.com/path
+                      # Наразі обмежуємося хостом.
+              except Exception:
+                 pass # Не вдалося отримати ім'я з URL
 
-         if subdir_name:
-              full_site_subdir_path = os.path.join(directory_to_archive, subdir_name)
+         if actual_subdir_name:
+              # Повний шлях до очікуваної піддиректорії сайту
+              full_site_subdir_path = os.path.join(directory_to_archive, actual_subdir_name)
 
               if os.path.isdir(full_site_subdir_path):
                    directory_to_include_in_archive = full_site_subdir_path
-                   target_directory_in_base_dir = subdir_name
+                   # target_directory_in_base_dir = actual_subdir_name # Не використовується
+                   if status_callback: GLib.idle_add(status_callback, f"Знайдено піддиректорію сайту: {actual_subdir_name}. Архівуємо її.")
               else:
-                   if status_callback: GLib.idle_add(status_callback, f"Попередження: Піддиректорія сайту '{full_site_subdir_path}' не знайдена. Архівуємо всю базову директорію.")
-
+                   # Якщо піддиректорія не знайдена, архівуємо всю базову директорію, як і раніше
+                   if status_callback: GLib.idle_add(status_callback, f"Попередження: Піддиректорія сайту '{actual_subdir_name}' не знайдена в '{directory_to_archive}'. Архівуємо всю директорію '{os.path.basename(directory_to_archive)}'.")
          else:
-              if status_callback: GLib.idle_add(status_callback, f"Попередження: Не вдалося визначити назву піддиректорії сайту з URL {site_url}. Архівуємо всю базову директорію.")
+              if status_callback: GLib.idle_add(status_callback, f"Попередження: Не вдалося визначити назву піддиректорії сайту з URL '{site_url}'. Архівуємо всю директорію '{os.path.basename(directory_to_archive)}'.")
 
-
-    root_dir_for_archive = os.path.dirname(directory_to_include_in_archive)
+    # root_dir: директорія, відносно якої будуть шляхи в архіві.
+    # base_dir: шлях до директорії, яку архівуємо, відносно root_dir.
+    # Щоб уникнути повних шляхів в архіві, встановлюємо root_dir на батьківську директорію того, що архівуємо.
+    root_dir_for_archive = os.path.dirname(os.path.abspath(directory_to_include_in_archive))
     base_dir_for_archive = os.path.basename(directory_to_include_in_archive)
 
-    abs_dir_to_include_in_archive = os.path.abspath(directory_to_include_in_archive)
-    if abs_dir_to_include_in_archive == os.path.abspath('.') and not target_directory_in_base_dir:
-         root_dir_for_archive = '.'
-         base_dir_for_archive = '.'
-    elif abs_dir_to_include_in_archive == os.path.abspath('/'):
-         if status_callback: GLib.idle_add(status_callback, f"Помилка: Архівування кореневої директорії '{directory_to_include_in_archive}' не підтримується.")
-         raise ValueError(f"Архівування кореневої директорії '{directory_to_include_in_archive}' не підтримується.")
-    elif not os.path.isabs(directory_to_include_in_archive) and not target_directory_in_base_dir:
-         root_dir_for_archive = '.'
-         base_dir_for_archive = directory_to_include_in_archive
-
-    else:
-        pass
+    # Спеціальний випадок: якщо архівуємо поточну директорію (наприклад, ".")
+    if os.path.abspath(directory_to_include_in_archive) == os.path.abspath(os.getcwd()):
+        root_dir_for_archive = os.getcwd() # Або батьківська директорія, якщо base_dir "."
+        base_dir_for_archive = "." # Архівувати вміст поточної директорії
+        if status_callback: GLib.idle_add(status_callback, "Налаштування для архівування вмісту поточної директорії.")
 
 
-    archive_base_name = os.path.splitext(os.path.basename(archive_path))[0]
-    if archive_format in ['gztar', 'bztar']:
-         archive_base_name = os.path.splitext(archive_base_name)[0]
+    # Видаляємо розширення з імені файлу архіву для shutil.make_archive
+    archive_base_name_for_shutil = os.path.join(os.path.dirname(archive_path), 
+                                                os.path.splitext(os.path.basename(archive_path))[0])
+    # Для .tar.gz/.tar.bz2 потрібно видалити два розширення
+    if archive_format in ['gztar', 'bztar'] and archive_base_name_for_shutil.lower().endswith('.tar'):
+         archive_base_name_for_shutil = os.path.splitext(archive_base_name_for_shutil)[0]
 
-    archive_parent_dir = os.path.dirname(archive_path)
-    if not archive_parent_dir:
-        archive_parent_dir = "."
 
-    if not os.path.isdir(archive_parent_dir):
+    archive_parent_dir = os.path.dirname(archive_path) # Директорія, де буде збережено архів
+    if not archive_parent_dir: # Якщо шлях відносний і без директорії
+        archive_parent_dir = "." # Поточна директорія
+
+    if not os.path.isdir(archive_parent_dir): # Переконуємося, що директорія для архіву існує
         if status_callback: GLib.idle_add(status_callback, f"Помилка: Батьківська директорія для архіву не існує: {archive_parent_dir}")
         raise FileNotFoundError(f"Батьківська директорія для архіву не існує: {archive_parent_dir}")
 
 
     if status_callback:
-        if target_directory_in_base_dir:
-             GLib.idle_add(status_callback, f"Архівування папки сайту '{base_dir_for_archive}'...")
-        elif directory_to_include_in_archive == '.':
-             GLib.idle_add(status_callback, f"Архівування вмісту поточної директорії ('.')...")
-        else:
-             GLib.idle_add(status_callback, f"Архівування директорії '{base_dir_for_archive}'...")
+        GLib.idle_add(status_callback, f"Архівування '{base_dir_for_archive}' (з '{root_dir_for_archive}') у '{archive_path}'...")
 
     try:
-        final_archive_path = shutil.make_archive(os.path.join(archive_parent_dir, archive_base_name),
+        # shutil.make_archive(base_name, format, root_dir=None, base_dir=None, ...)
+        # base_name - це шлях до архіву БЕЗ розширення формату
+        # root_dir - директорія, відносно якої base_dir
+        # base_dir - що саме архівувати (відносно root_dir)
+        final_archive_path = shutil.make_archive(archive_base_name_for_shutil,
                                                  archive_format,
                                                  root_dir=root_dir_for_archive,
                                                  base_dir=base_dir_for_archive)
@@ -168,7 +217,7 @@ def archive_directory_threaded(directory_to_archive, archive_path, status_callba
 
         if status_callback: GLib.idle_add(status_callback, f"Архівування завершено: {os.path.basename(final_archive_path)}")
 
-    except FileNotFoundError:
+    except FileNotFoundError: # Може виникнути, якщо немає утиліт zip/tar
         if status_callback: GLib.idle_add(status_callback, f"Помилка: Не знайдено утиліти для формату '{archive_format}'.")
         raise RuntimeError(f"Помилка: Не знайдено утиліти для створення архіву формату '{archive_format}'. Переконайтеся, що встановлено zip/tar/gzip/bzip2.")
     except Exception as e:
