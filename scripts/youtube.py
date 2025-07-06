@@ -1,138 +1,150 @@
-# scripts/youtube.py
-
 import yt_dlp
 import os
 import re
 import time
-import traceback
+import logging
 from typing import Optional, Callable, Dict, Any, List, Union
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+from yt_dlp.utils import download_range_func
 
-def clean_string(s: str) -> str:
-    if not isinstance(s, str): return ""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    cleaned = ansi_escape.sub('', s)
-    return re.sub(r'\s+', ' ', cleaned).strip()
+logger = logging.getLogger(__name__)
 
 def _get_default_ydl_opts() -> Dict[str, Any]:
     return {
         'nocheckcertificate': True,
-        'ignoreerrors': True,
         'quiet': True,
         'verbose': False,
         'no_warnings': True,
         'continuedl': True,
     }
 
-def extract_youtube_info(url: str, extra_opts: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def get_youtube_info(url: str, extra_opts: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     ydl_opts = _get_default_ydl_opts()
     ydl_opts['extract_flat'] = 'in_playlist'
     ydl_opts['skip_download'] = True
-    if extra_opts: ydl_opts.update(extra_opts)
+    if extra_opts:
+        ydl_opts.update(extra_opts)
+    
+    logger.info(f"Вилучення інформації для URL: {url}")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception as e:
-        print(f"Помилка вилучення інформації yt-dlp: {e}")
+        logger.error(f"Помилка вилучення інформації yt-dlp для '{url}': {e}", exc_info=True)
         return None
 
-def download_youtube_media(
-    urls: Union[str, List[str]],
-    output_dir: str,
-    download_mode: str = 'default',
-    format_selection: str = "best",
-    audio_format_override: Optional[str] = None,
-    download_subs: bool = False,
-    sub_langs: Optional[str] = None,
-    embed_subs: bool = False,
-    status_callback: Optional[Callable[[str], None]] = None,
-    progress_callback: Optional[Callable[[float], None]] = None
-):
-    def _safe_callback(callback: Optional[Callable], *args: Any, **kwargs: Any):
-        if callback and callable(callback):
-            try:
-                callback(*args, **kwargs)
-            except Exception as e:
-                print(f"Помилка під час виклику callback {callback.__name__}: {e}")
+def download_youtube_media(kwargs, comm_queue):
+    url = kwargs.get('url')
+    output_dir = kwargs.get('output_dir')
+    download_mode = kwargs.get('download_mode', 'default')
+    format_selection = kwargs.get('format_selection', "best_mp4")
+    max_resolution = kwargs.get('max_resolution')
+    audio_quality = kwargs.get('audio_quality', 5)
+    playlist_start = kwargs.get('playlist_start', 0)
+    playlist_end = kwargs.get('playlist_end', 0)
+    concurrent_fragments = kwargs.get('concurrent_fragments', 4)
+    skip_downloaded = kwargs.get('skip_downloaded', False)
+    time_start = kwargs.get('time_start')
+    time_end = kwargs.get('time_end')
+    clean_filename = kwargs.get('clean_filename', False)
+    ignore_errors = kwargs.get('ignore_errors', True)
+    download_subs = kwargs.get('download_subs', False)
+    sub_langs = kwargs.get('sub_langs')
+    embed_subs = kwargs.get('embed_subs', False)
 
-    _start_time = time.time()
+    def send_status(message):
+        comm_queue.put({"type": "status", "value": message})
+    def send_progress(fraction):
+        comm_queue.put({"type": "progress", "value": fraction})
+    def send_done(message):
+        comm_queue.put({"type": "done", "value": message})
+    def send_error(message):
+        comm_queue.put({"type": "error", "value": message})
+
     _last_reported_progress = -1.0
 
     def progress_hook(d: Dict[str, Any]):
-        nonlocal _start_time, _last_reported_progress
+        nonlocal _last_reported_progress
         status = d.get('status')
         if status == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
             downloaded = d.get('downloaded_bytes')
             if total and downloaded is not None:
                 fraction = min(1.0, downloaded / total)
-                if abs(fraction - _last_reported_progress) > 0.001:
-                    _safe_callback(progress_callback, fraction); _last_reported_progress = fraction
-            title = d.get('info_dict', {}).get('title', '...')
-            _safe_callback(status_callback, f"Завантаження '{title[:50]}...': {d.get('_percent_str', '')}")
+                if abs(fraction - _last_reported_progress) > 0.005:
+                    send_progress(fraction)
+                    _last_reported_progress = fraction
+            
+            filename = d.get('filename') or "..."
+            title = os.path.basename(filename)
+            percent_str = d.get('_percent_str', '')
+            speed_str = d.get('_speed_str', '')
+            eta_str = d.get('_eta_str', '')
+            send_status(f"Завантаження '{title}': {percent_str} ({speed_str}, ETA: {eta_str})")
+
         elif status == 'finished':
-            _safe_callback(progress_callback, 1.0)
-            _safe_callback(status_callback, f"Завершено: {os.path.basename(d.get('filename', ''))}")
+            send_progress(1.0)
+            send_status(f"Завершено: {os.path.basename(d.get('filename', ''))}")
         elif status == 'error':
-            _safe_callback(status_callback, "Помилка завантаження...")
-
-    ydl_opts = _get_default_ydl_opts()
-    ydl_opts['progress_hooks'] = [progress_hook]
-
-    # --- ФІНАЛЬНА ВИПРАВЛЕНА ЛОГІКА ---
-
-    # 1. Встановлюємо опцію 'noplaylist' залежно від режиму.
-    #    Це єдиний надійний спосіб контролювати поведінку.
-    if download_mode == 'single_flat':
-        # Примусово завантажувати ТІЛЬКИ ОДНЕ відео, ігноруючи будь-які
-        # плейлисти або списки відео на каналі.
-        ydl_opts['noplaylist'] = True
-    else:
-        # Для всіх інших режимів (default, music, flat_playlist) ми ДОЗВОЛЯЄМО
-        # завантажувати плейлисти/канали, якщо вони є в URL.
-        ydl_opts['noplaylist'] = False
-
-    # 2. Встановлюємо шаблон шляху збереження.
-    if download_mode in ['music', 'flat_playlist', 'single_flat']:
-        # Всі ці режими вимагають пласкої структури в цільовій папці.
-        ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
-    else:  # 'default'
-        # Стандартний режим створює підпапки за назвою каналу.
-        ydl_opts['outtmpl'] = os.path.join(output_dir, '%(uploader)s', '%(title)s.%(ext)s')
-
-    # --- КІНЕЦЬ ФІНАЛЬНОЇ ЛОГІКИ ---
-
-
-    # 3. Обробка формату (залишається без змін).
-    local_format_selection = format_selection
-    if download_mode == 'music' and not format_selection.startswith('audio_'):
-        local_format_selection = 'audio_mp3'
-
-    is_audio_only = local_format_selection.startswith('audio_')
-    
-    if local_format_selection == 'best': ydl_opts['format'] = 'bestvideo+bestaudio/best'
-    elif local_format_selection == 'best_mp4':
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        ydl_opts['merge_output_format'] = 'mp4'
-    elif is_audio_only:
-        ydl_opts['format'] = 'bestaudio/best'
-        target_codec = audio_format_override
-        if not target_codec or target_codec == 'best':
-            if local_format_selection == 'audio_mp3': target_codec = 'mp3'
-            elif local_format_selection == 'audio_m4a': target_codec = 'aac'
-        if target_codec and target_codec != 'best':
-            ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': target_codec}]
-    
-    if download_subs and not is_audio_only:
-        ydl_opts['writesubtitles'] = True
-        ydl_opts['writeautomaticsub'] = True
-        ydl_opts['subtitleslangs'] = [lang.strip() for lang in (sub_langs or 'uk,en').split(',')]
-        if embed_subs: ydl_opts['embedsubtitles'] = True
+            send_status("Помилка завантаження...")
 
     try:
+        ydl_opts = _get_default_ydl_opts()
+        ydl_opts['ignoreerrors'] = ignore_errors
+        ydl_opts['progress_hooks'] = [progress_hook]
+
+        if download_mode == 'default':
+            ydl_opts['outtmpl'] = os.path.join(output_dir, '%(channel,uploader)s', '%(title)s.%(ext)s')
+        else: # music, flat_playlist, single_flat all go into one folder
+             ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
+        
+        is_audio_only = download_mode == 'music'
+        if is_audio_only:
+            ydl_opts['format'] = f'bestaudio/best'
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': str(audio_quality)}]
+        else:
+            res_filter = ""
+            if max_resolution and max_resolution != "best":
+                res_filter = f"[height<={max_resolution}]"
+            
+            if format_selection == 'best_mp4':
+                ydl_opts['format'] = f'bestvideo{res_filter}[ext=mp4]+bestaudio[ext=m4a]/best{res_filter}[ext=mp4]/best{res_filter}'
+                ydl_opts['merge_output_format'] = 'mp4'
+            else: # best webm/mkv
+                ydl_opts['format'] = f'bestvideo{res_filter}+bestaudio/best{res_filter}'
+                
+        if download_mode == 'single_flat':
+            ydl_opts['noplaylist'] = True
+
+        if playlist_start > 0: ydl_opts['playliststart'] = playlist_start
+        if playlist_end > 0: ydl_opts['playlistend'] = playlist_end
+
+        if concurrent_fragments > 1: ydl_opts['concurrent_fragment_downloads'] = concurrent_fragments
+
+        if skip_downloaded:
+            archive_file = os.path.join(output_dir, '.yt-dlp-archive.txt')
+            ydl_opts['download_archive'] = archive_file
+        
+        if time_start or time_end:
+            ydl_opts['download_ranges'] = download_range_func(None, [(time_start or "00:00:00", time_end)])
+
+        if download_subs and not is_audio_only:
+            ydl_opts['writesubtitles'] = True
+            ydl_opts['writeautomaticsub'] = True
+            ydl_opts['subtitleslangs'] = [lang.strip() for lang in (sub_langs or 'uk,en').split(',')]
+            if embed_subs:
+                ydl_opts['embedsubtitles'] = True
+
+        logger.info(f"Запуск yt-dlp з параметрами: {ydl_opts}")
+        send_status(f"Запуск yt-dlp для {url}...")
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            download_list = [urls] if isinstance(urls, str) else urls
+            download_list = [url] if isinstance(url, str) else url
             ydl.download(download_list)
+        
+        send_done("Завантаження YouTube завершено.")
+
     except Exception as e:
-        _safe_callback(status_callback, f"Помилка yt-dlp: {e}")
-        raise e
+        import traceback
+        error_msg = f"Критична помилка yt-dlp: {e}\n{traceback.format_exc()}"
+        logger.critical(error_msg)
+        send_error(error_msg)
