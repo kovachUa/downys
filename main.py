@@ -134,7 +134,9 @@ class AppWindow(Gtk.Window):
         self.show_all()
 
     def _build_task_management_ui(self, parent_box):
-        self.task_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=250)
+        # Set transition_duration to 0 and initially hide the revealer
+        self.task_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=0)
+        self.task_revealer.set_reveal_child(False) 
         parent_box.pack_end(self.task_revealer, False, False, 0)
         
         task_frame = Gtk.Frame(label=_("Активні завдання"), margin=5)
@@ -163,7 +165,8 @@ class AppWindow(Gtk.Window):
         
         self.task_listbox.add(row)
         row.show_all()
-        self.task_revealer.set_reveal_child(True)
+        # Remove this line to keep the revealer hidden by default
+        # self.task_revealer.set_reveal_child(True) 
 
     def _remove_task_from_ui(self, task_id):
         for row in self.task_listbox.get_children():

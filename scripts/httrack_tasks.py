@@ -1,137 +1,218 @@
 import subprocess
 import os
 import shutil
-import sys 
-import time
-from urllib.parse import urlparse
+import sys
 import re
 import logging
+import traceback
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-def run_httrack_web_threaded(url, output_dir, kwargs, comm_queue): 
-    max_depth = kwargs.get('max_depth', 3)
-    max_rate = kwargs.get('max_rate', 50000)
-    sockets = kwargs.get('sockets', 2)
-    archive_after = kwargs.get('archive_after_mirror', False)
-    archive_path = kwargs.get('post_mirror_archive_path', None)
+def run_httrack_web_threaded(url, output_dir, kwargs, comm_queue):
+    def send(type_, message, details=""):
+        data = {"type": type_, "value": message}
+        if details:
+            data["details"] = details
+        comm_queue.put(data)
 
-    def send_status(message):
-        comm_queue.put({"type": "status", "value": message})
-    def send_done(message):
-        comm_queue.put({"type": "done", "value": message})
-    def send_error(message):
-        comm_queue.put({"type": "error", "value": message})
-        
+    def send_status(msg): send("status", msg)
+    def send_done(msg): send("done", msg)
+    def send_error(msg, details=""): send("error", msg, details)
+
     try:
-        if not url or not output_dir:
-            raise ValueError("Не вказано URL або директорію для HTTrack.")
+        if not url:
+            return send_error("Помилка: URL не вказано.", "Будь ласка, надайте дійсний URL.")
+        if not output_dir:
+            return send_error("Помилка: Не вказано директорію виводу.", "Вкажіть шлях для збереження сайту.")
 
-        parent_dir = os.path.dirname(output_dir)
-        if parent_dir and not os.path.isdir(parent_dir):
-            raise FileNotFoundError(f"Батьківська директорія не існує: {parent_dir}")
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+
+        parent_dir = os.path.abspath(output_dir)
+        if not os.path.isdir(parent_dir):
+            try:
+                os.makedirs(parent_dir, exist_ok=True)
+                send_status(f"Створено директорію виводу: {parent_dir}")
+            except Exception as e:
+                return send_error(f"Не вдалося створити директорію: {parent_dir}", str(e))
 
         parsed_url = urlparse(url)
-        domain = parsed_url.netloc
-        if domain.startswith('www.'): domain = domain[4:]
-        site_subdir_name = re.sub(r'[^\w.-]+', '_', domain).strip('_')
+        domain = parsed_url.netloc or ''
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        if not domain:
+            return send_error("Неможливо визначити домен з URL.", "Перевірте формат (наприклад, 'http://example.com').")
 
+        site_subdir_name = re.sub(r'[^\w.-]+', '_', domain).strip('_')
+        project_dir = os.path.join(parent_dir, site_subdir_name)
+
+        max_depth = kwargs.get('max_depth', 3)
+        max_rate = kwargs.get('max_rate', 0)
+        sockets = kwargs.get('sockets', 4)
+        archive_after = kwargs.get('archive_after_mirror', False)
+        archive_path = kwargs.get('post_mirror_archive_path')
+        follow_robots = kwargs.get('follow_robots', True)
+        mirror_mode = kwargs.get('mirror_mode', 'create')
+
+        # --- ЗМІНЕНО: Команда тепер отримує батьківську директорію (`parent_dir`) ---
+        # Це змусить HTTrack створити папку `site_subdir_name` всередині `parent_dir`,
+        # уникаючи подвійного вкладення.
         command = [
-            'httrack', url, '-O', output_dir,
-            '--robots=0', '--timeout=30', '--disable-security-limits',
-            '--keep-alive', '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
-            f'-* +*.{domain}/*'
+            'httrack', url,
+            '-O', parent_dir, # <--- ОСНОВНА ЗМІНА ТУТ
+            '--timeout=20', '--disable-security-limits',
+            '--keep-alive',
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            '--cache=4',
+            '--verbose'
         ]
+        # --- КІНЕЦЬ ЗМІНИ ---
+
+        if mirror_mode == 'update':
+            command.append('--update')
+            send_status("Режим: Оновлення існуючого дзеркала.")
+            if not os.path.isdir(project_dir):
+                send_status(f"Увага: директорія проекту '{project_dir}' не існує. HTTrack може створити її.")
+        else:
+            command.append('--mirror')
+            send_status("Режим: Створення нового дзеркала.")
+            if os.path.isdir(project_dir):
+                send_status(f"Увага: директорія проекту '{project_dir}' вже існує. HTTrack продовжить завантаження.")
+
+        if follow_robots:
+            command.extend(['--robots', '1'])
+        else:
+            command.extend(['--robots', '0'])
+            send_status("Ігнорування robots.txt.")
         
-        if max_depth is not None: command.extend(['--depth', str(max_depth)])
-        if max_rate is not None and max_rate > 0: command.extend(['--max-rate', str(max_rate)])
-        if sockets is not None and sockets > 0: command.extend(['--sockets', str(sockets)])
+        if max_depth: 
+            command.extend(['--depth', str(max_depth)])
+        if max_rate > 0: 
+            command.extend(['--max-rate', str(max_rate)])
+        if sockets > 0: 
+            command.extend(['--sockets', str(sockets)])
 
         send_status(f"Запуск HTTrack для {url}...")
-        logger.info(f"Executing HTTrack command: {' '.join(command)}")
+        logger.info(f"HTTrack команда: {' '.join(command)}")
 
         si = None
         if sys.platform == "win32":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = subprocess.SW_HIDE 
+            si.wShowWindow = subprocess.SW_HIDE
 
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                   text=True, encoding='utf-8', errors='replace',
-                                   bufsize=1, startupinfo=si)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace',
+            bufsize=1, startupinfo=si
+        )
 
+        has_output = False
         for line in iter(process.stdout.readline, ''):
-            if line: send_status(f"HTTrack: {line.strip()}")
-        
+            if line:
+                line_strip = line.strip()
+                send_status(f"HTTrack: {line_strip}")
+                has_output = True
+
+        process.wait(timeout=300)
         stdout_rem, stderr_rem = process.communicate()
+
+        if stdout_rem:
+            for line in stdout_rem.strip().splitlines():
+                send_status(f"HTTrack: {line.strip()}")
+                has_output = True
+
         if process.returncode != 0:
-            error_message = f"HTTrack завершився з помилкою (код {process.returncode}).\n\nStderr:\n{stderr_rem.strip()}\n\nStdout:\n{stdout_rem.strip()}"
-            raise subprocess.CalledProcessError(process.returncode, command, output=stdout_rem, stderr=stderr_rem)
+            error_details = stderr_rem.strip()
+            if not error_details and has_output:
+                error_details = "HTTrack завершився з помилкою. Можливо, були передані невірні аргументи."
+            
+            logger.error(f"HTTrack завершено з помилкою. Команда: {' '.join(command)}")
+            logger.error(f"Код помилки: {process.returncode}")
+            logger.error(f"Stderr:\n{stderr_rem}")
+            return send_error(
+                f"HTTrack завершився з помилкою (код {process.returncode}).",
+                f"Деталі:\n{error_details}"
+            )
 
-        send_status(f"HTTrack успішно завершено.")
+        if not has_output:
+            send_status("Завершено без виводу. Можливо, сайт вже повністю завантажено.")
 
-        if archive_after:
-            final_mirror_dir = os.path.join(output_dir, site_subdir_name)
-            if not os.path.isdir(final_mirror_dir):
-                 logger.warning(f"Could not find expected mirror directory '{final_mirror_dir}'. Will try to archive parent '{output_dir}'.")
-                 final_mirror_dir = output_dir
-
-            archive_directory_threaded(final_mirror_dir, archive_path, {'source_already_validated': True}, comm_queue)
+        complete_file = os.path.join(project_dir, 'hts-cache', 'complete.txt')
+        if os.path.exists(complete_file):
+            send_status("Завантаження успішно завершено!")
         else:
-             send_done(f"Сайт збережено в {output_dir}.")
+            send_status("Завантаження зупинено. Можна продовжити пізніше.")
+
+        if archive_after and mirror_mode == 'create':
+            send_status("Архівація завантаженого сайту...")
+            archive_directory_threaded(project_dir, archive_path, {'source_already_validated': True}, comm_queue)
+        else:
+            # Повідомлення про завершення все ще використовує `project_dir`, що правильно
+            send_done(f"Операцію завершено. Сайт знаходиться в {project_dir}.")
 
     except FileNotFoundError:
-        send_error("Команда 'httrack' не знайдена. Переконайтеся, що HTTrack встановлено і доступний у PATH.")
+        send_error("HTTrack не знайдено.", "Переконайтеся, що HTTrack встановлено і є у PATH.")
+    except subprocess.CalledProcessError as e:
+        send_error(f"HTTrack завершився з помилкою (код {e.returncode}).",
+                   f"Команда: {' '.join(e.cmd)}\nПомилка: {e.stderr}")
     except Exception as e:
-        import traceback
-        error_msg = f"Неочікувана помилка під час виконання HTTrack: {e}\n{traceback.format_exc()}"
-        logger.critical(error_msg)
-        send_error(error_msg)
+        send_error(f"Неочікувана помилка: {e}", traceback.format_exc())
+
 
 def archive_directory_threaded(directory_to_archive, archive_path, kwargs, comm_queue):
-    def send_status(message):
-        comm_queue.put({"type": "status", "value": message})
-    def send_done(message):
-        comm_queue.put({"type": "done", "value": message})
-    def send_error(message):
-        comm_queue.put({"type": "error", "value": message})
-        
+    def send(type_, message, details=""):
+        data = {"type": type_, "value": message}
+        if details:
+            data["details"] = details
+        comm_queue.put(data)
+
+    def send_status(msg): send("status", msg)
+    def send_done(msg): send("done", msg)
+    def send_error(msg, details=""): send("error", msg, details)
+
     try:
         if not kwargs.get('source_already_validated'):
-            if not directory_to_archive or not os.path.isdir(directory_to_archive):
-                raise FileNotFoundError(f"Директорія для архівування не знайдена: {directory_to_archive}")
+            if not os.path.isdir(directory_to_archive):
+                return send_error(f"Директорія '{directory_to_archive}' не існує.")
             if not archive_path:
-                raise ValueError("Не вказано шлях для файлу архіву.")
+                return send_error("Не вказано шлях для архіву.")
 
-        archive_format = None
-        path_lower = archive_path.lower()
-        if path_lower.endswith(('.tar.gz', '.tgz')): archive_format = 'gztar'
-        elif path_lower.endswith(('.tar.bz2', '.tbz2')): archive_format = 'bztar'
-        elif path_lower.endswith('.zip'): archive_format = 'zip'
-        elif path_lower.endswith('.tar'): archive_format = 'tar'
+        ext = os.path.splitext(archive_path)[1].lower()
+        if ext in ['.tar.gz', '.tgz']:
+            archive_format = 'gztar'
+        elif ext in ['.tar.bz2', '.tbz2']:
+            archive_format = 'bztar'
+        elif ext == '.zip':
+            archive_format = 'zip'
+        elif ext == '.tar':
+            archive_format = 'tar'
         else:
-            raise ValueError(f"Непідтримуваний формат архіву для: {archive_path}")
+            return send_error(
+                f"Непідтримуваний формат архіву: {archive_path}",
+                "Підтримувані формати: .tar.gz, .tgz, .tar.bz2, .tbz2, .zip, .tar"
+            )
 
-        archive_parent_dir = os.path.dirname(archive_path)
-        if archive_parent_dir and not os.path.isdir(archive_parent_dir):
-            os.makedirs(archive_parent_dir, exist_ok=True)
-            send_status(f"Створено директорію для архіву: {archive_parent_dir}")
+        archive_dir = os.path.dirname(archive_path)
+        if archive_dir and not os.path.exists(archive_dir):
+            os.makedirs(archive_dir, exist_ok=True)
+            send_status(f"Створено директорію для архіву: {archive_dir}")
 
-        root_dir_for_archive = os.path.dirname(os.path.abspath(directory_to_archive))
-        base_dir_for_archive = os.path.basename(directory_to_archive)
-        
-        archive_base_name = os.path.splitext(archive_path)[0]
-        if archive_base_name.endswith('.tar'):
-            archive_base_name = os.path.splitext(archive_base_name)[0]
+        base_name = os.path.splitext(archive_path)[0]
+        if base_name.endswith('.tar'):
+            base_name = os.path.splitext(base_name)[0]
 
-        send_status(f"Архівування '{base_dir_for_archive}' у '{archive_path}'...")
-        logger.info(f"Archiving: base_name='{archive_base_name}', format='{archive_format}', root_dir='{root_dir_for_archive}', base_dir='{base_dir_for_archive}'")
+        send_status(f"Архівування '{os.path.basename(directory_to_archive)}' у '{archive_path}'...")
+        final_archive_path = shutil.make_archive(
+            base_name, 
+            archive_format,
+            root_dir=os.path.dirname(os.path.abspath(directory_to_archive)),
+            base_dir=os.path.basename(directory_to_archive)
+        )
 
-        final_archive_path = shutil.make_archive(archive_base_name, archive_format, root_dir_for_archive, base_dir_for_archive)
-        send_done(f"Архівування завершено: {os.path.basename(final_archive_path)}")
+        send_done(f"Архів створено: {os.path.basename(final_archive_path)}")
 
     except Exception as e:
-        import traceback
-        error_msg = f"Помилка під час архівації: {e}\n{traceback.format_exc()}"
-        logger.critical(error_msg)
-        send_error(error_msg)
+        send_error(f"Помилка архівації: {e}", traceback.format_exc())
