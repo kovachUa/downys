@@ -6,7 +6,7 @@ from yt_dlp.utils import download_range_func
 
 logger = logging.getLogger(__name__)
 
-stop_requested = False  # Флаг для зупинки завантаження
+stop_requested = False
 
 
 def stop_download():
@@ -38,8 +38,8 @@ def log_available_formats(info):
 def _get_default_ydl_opts() -> Dict[str, Any]:
     return {
         'nocheckcertificate': True,
-        'quiet': False,   # показуємо хід роботи
-        'verbose': True,  # детальніше логування
+        'quiet': False,
+        'verbose': True,
         'no_warnings': False,
         'continuedl': True
     }
@@ -72,7 +72,8 @@ def download_youtube_media(kwargs, comm_queue):
 
     url, output_dir = kwargs.get('url'), kwargs.get('output_dir')
     download_mode = kwargs.get('download_mode', 'default')
-    format_selection = kwargs.get('format_selection', "best_mp4")
+    manual_format = kwargs.get('manual_format')
+    playlist_items = kwargs.get('playlist_items')
     max_resolution = kwargs.get('max_resolution')
     audio_quality = kwargs.get('audio_quality', 5)
     playlist_start = kwargs.get('playlist_start', 0)
@@ -81,7 +82,6 @@ def download_youtube_media(kwargs, comm_queue):
     skip_downloaded = kwargs.get('skip_downloaded', False)
     time_start = kwargs.get('time_start')
     time_end = kwargs.get('time_end')
-    clean_filename = kwargs.get('clean_filename', False)
     ignore_errors = kwargs.get('ignore_errors', True)
     download_subs = kwargs.get('download_subs', False)
     sub_langs = kwargs.get('sub_langs')
@@ -90,6 +90,9 @@ def download_youtube_media(kwargs, comm_queue):
     avoid_av1 = kwargs.get('avoid_av1', True)
     prefer_h264 = kwargs.get('prefer_h264', True)
     max_bitrate = kwargs.get('max_bitrate')
+    embed_thumbnail = kwargs.get('embed_thumbnail', False)
+    use_sponsorblock = kwargs.get('use_sponsorblock', False)
+    sponsorblock_cats = kwargs.get('sponsorblock_cats', 'all')
 
     def send_status(message): comm_queue.put({"type": "status", "value": message})
     def send_progress(fraction): comm_queue.put({"type": "progress", "value": fraction})
@@ -115,57 +118,70 @@ def download_youtube_media(kwargs, comm_queue):
 
     try:
         ydl_opts = _get_default_ydl_opts()
-        ydl_opts.update({'ignoreerrors': ignore_errors, 'progress_hooks': [progress_hook]})
+        ydl_opts.update({
+            'ignoreerrors': ignore_errors,
+            'progress_hooks': [progress_hook],
+            'addmetadata': True,
+            'embedchapters': True
+        })
 
-        # Формування шляхів збереження
         if download_mode == 'default':
             ydl_opts['outtmpl'] = os.path.join(output_dir, '%(channel,uploader)s', '%(title)s.%(ext)s')
         elif download_mode == 'flat_playlist':
-            ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
-            ydl_opts['noplaylist'] = False
+            ydl_opts['outtmpl'] = os.path.join(output_dir, 'Videos', '%(title)s.%(ext)s')
         elif download_mode == 'single_flat':
-            ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
+            ydl_opts['outtmpl'] = os.path.join(output_dir, 'Videos', '%(title)s.%(ext)s')
             ydl_opts['noplaylist'] = True
         elif download_mode == 'music':
-            ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
+            ydl_opts['outtmpl'] = os.path.join(output_dir, 'Music', '%(title)s.%(ext)s')
 
         is_audio_only = download_mode == 'music'
+        
+        ydl_opts.setdefault('postprocessors', [])
 
-        # Формат завантаження
         if is_audio_only:
+            ydl_opts['postprocessors'].append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': str(audio_quality)
+            })
+        
+        if embed_thumbnail:
+            ydl_opts['postprocessors'].append({'key': 'EmbedThumbnail'})
+        
+        if manual_format:
+            ydl_opts['format'] = manual_format
+        elif is_audio_only:
             ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] = [
-                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': str(audio_quality)}
-            ]
         else:
             format_filters = []
-            if max_resolution and max_resolution != "best":
-                format_filters.append(f"height<={max_resolution}")
-            if avoid_av1:
-                format_filters.append("vcodec!~='^av01'")
-            if prefer_h264:
-                format_filters.append("vcodec^='avc1'")
-            if max_bitrate and max_bitrate > 0:
-                format_filters.append(f"tbr<={max_bitrate}")
+            if avoid_av1: format_filters.append("vcodec!~='^av01'")
+            if max_bitrate and max_bitrate > 0: format_filters.append(f"tbr<={max_bitrate}")
+            filter_str = ''.join(f'[{f}]' for f in format_filters)
 
-            format_filter_str = ''.join(f'[{f}]' for f in format_filters)
-            base_format = f"bestvideo{format_filter_str}+bestaudio/best{format_filter_str}/best"
+            sorters = []
+            if max_resolution and max_resolution != "best": sorters.append(f"res:{max_resolution}")
+            sorters.append("fps")
+            if prefer_h264: sorters.append("vcodec:h264")
 
-            if format_selection == 'best_mp4' or force_mp4:
-                ydl_opts['format'] = f"{base_format}[ext=mp4]/best"
-                ydl_opts['merge_output_format'] = 'mp4'
-            else:
-                ydl_opts['format'] = base_format
-
+            base_format = f"bestvideo*{filter_str}+bestaudio/best{filter_str}"
+            ydl_opts['format'] = base_format
+            if sorters: ydl_opts['format_sorter'] = sorters
+            
             if force_mp4:
-                ydl_opts.setdefault('postprocessors', []).append(
-                    {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}
-                )
+                ydl_opts['postprocessors'].append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
+            else:
+                ydl_opts['merge_output_format'] = 'mp4'
 
-        if playlist_start > 0:
-            ydl_opts['playliststart'] = playlist_start
-        if playlist_end > 0:
-            ydl_opts['playlistend'] = playlist_end
+        if playlist_items:
+            ydl_opts['playlist_items'] = playlist_items
+        else:
+            if playlist_start > 0: ydl_opts['playliststart'] = playlist_start
+            if playlist_end > 0: ydl_opts['playlistend'] = playlist_end
+
+        if use_sponsorblock and not is_audio_only:
+             ydl_opts['sponsorblock_remove'] = sponsorblock_cats
+
         if concurrent_fragments > 1:
             ydl_opts['concurrent_fragment_downloads'] = concurrent_fragments
         if skip_downloaded:
@@ -183,10 +199,8 @@ def download_youtube_media(kwargs, comm_queue):
 
         logger.info(f"Запуск yt-dlp з параметрами: {ydl_opts}")
         send_status(f"Запуск yt-dlp для {url}...")
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-
         send_done("Завантаження YouTube завершено.")
     except Exception as e:
         import traceback
